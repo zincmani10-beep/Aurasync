@@ -41,19 +41,74 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
 
+          # Read the profile's own name, UUID and Team ID so nothing has to be typed by hand
+          security cms -D -i $PP_PATH > $RUNNER_TEMP/profile.plist
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" $RUNNER_TEMP/profile.plist)
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" $RUNNER_TEMP/profile.plist)
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" $RUNNER_TEMP/profile.plist)
+          echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
+          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+          echo "Using profile: $PROFILE_NAME (team $TEAM_ID)"
+
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+
+      - name: Configure Bundle ID and manual signing
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          p = 'ios/Runner.xcodeproj/project.pbxproj'
+          s = open(p).read()
+          s = s.replace('com.example.auramatrixApp', 'com.mbstudio.auramatrix')
+          team = os.environ['TEAM_ID']
+          prof = os.environ['PROFILE_NAME']
+
+          def fix(m):
+              b = m.group(0)
+              if 'PRODUCT_BUNDLE_IDENTIFIER = com.mbstudio.auramatrix;' not in b:
+                  return b
+              for k in ['CODE_SIGN_STYLE', 'DEVELOPMENT_TEAM', 'PROVISIONING_PROFILE_SPECIFIER', 'CODE_SIGN_IDENTITY']:
+                  b = re.sub(r'\n[ \t]*"?' + k + r'(\[[^\]]*\])?"? = [^\n]*;', '', b)
+              ins = ('\n\t\t\t\tCODE_SIGN_STYLE = Manual;'
+                     '\n\t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";'
+                     '\n\t\t\t\tDEVELOPMENT_TEAM = %s;'
+                     '\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "%s";') % (team, prof)
+              return b.replace('buildSettings = {', 'buildSettings = {' + ins, 1)
+
+          s = re.sub(r'/\* Release \*/ = \{.*?name = Release;', fix, s, flags=re.S)
+          open(p, 'w').write(s)
+          EOF
+          grep -n "PRODUCT_BUNDLE_IDENTIFIER\|CODE_SIGN_STYLE\|PROVISIONING_PROFILE_SPECIFIER" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Write ExportOptions.plist
+        run: |
+          cat > ios/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.mbstudio.auramatrix</key>
+              <string>$PROFILE_NAME</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
 
       - name: Build IPA with API Key
-        run: flutter build ipa --release --export-options-plist=ios/ExportOptions.plist
-        # If your app needs the API key at build time, add your existing
-        # --dart-define=... flag to the command above.
+        # If your old workflow had env: values or --dart-define flags on this step,
+        # copy them here too.
+        run: flutter build ipa --release --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.plist
 
       - name: Upload to TestFlight
         env:
-          API_KEY_ID: ${{ secrets.APP_STORE_API_KEY_ID }}
-          API_ISSUER_ID: ${{ secrets.APP_STORE_ISSUER_ID }}
-          API_PRIVATE_KEY: ${{ secrets.APP_STORE_API_PRIVATE_KEY }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          API_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
         run: |
           mkdir -p ~/private_keys
           echo -n "$API_PRIVATE_KEY" > ~/private_keys/AuthKey_${API_KEY_ID}.p8
