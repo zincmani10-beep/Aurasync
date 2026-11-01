@@ -61,10 +61,6 @@ try:
     from openai import OpenAI
 except Exception:  # pragma: no cover - openai is optional; the rule-based engine still works
     OpenAI = None
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover - openai is optional; the rule-based engine still works
-    OpenAI = None
 
 st.set_page_config(page_title="AuraSync | Luxury Ambient Intelligence",
                    page_icon="✨", layout="wide")
@@ -1943,6 +1939,12 @@ def push(dev):
     """Send the device's current state to the real device (no-op for Simulation)."""
     if dev["proto"] == "Simulation" or dev["status"] != "connected" or not dev["addr"]:
         return
+    if native_on():                     # the iPhone app sends the command from inside the home network
+        c = native_dev_cmd(dev)
+        if c:
+            native_enqueue(c)
+            dev["last"] = "sent to phone " + datetime.now().strftime("%H:%M:%S")
+        return
     try:
         if dev["proto"].startswith("Philips"):
             r, g, b = hex_rgb(dev["color"])
@@ -1962,6 +1964,9 @@ def push(dev):
 
 def connect_device(dev):
     """Handshake with the device. Simulation always succeeds; real transports are really probed."""
+    if native_on() and dev["proto"] != "Simulation":
+        dev["status"], dev["last"] = "connected", "via phone (not verified)"
+        return True
     try:
         if dev["proto"] == "Simulation":
             dev["status"], dev["last"] = "connected", "simulated device ready"
@@ -2759,6 +2764,117 @@ SCN = {"relaxed": (68, (50, 70), 33.6, False), "active": (90, (38, 55), 34.8, Fa
        "wake": (73, (48, 60), 33.8, False)}
 
 
+
+# ---- Phone bridge: the Flutter iPhone app sends commands to bulbs / fans / ACs inside the home network ----
+# Streamlit runs on a cloud server that cannot reach devices in a house, so when the page runs inside the iPhone app
+# the commands are queued here, handed to the app through the "AuraNative" channel, and sent from the phone.
+NATIVE_OUT_HTML = """
+<script>
+(function () {
+  var Q = __Q__;
+  function wins() { var o = []; [window, window.parent, window.top].forEach(function (w) { try { if (w && o.indexOf(w) < 0) { void w.document; o.push(w); } } catch (e) {} }); return o; }
+  function send(m) {
+    var s = JSON.stringify(m), L = wins();
+    for (var i = 0; i < L.length; i++) {
+      var w = L[i];
+      try { if (w.AuraNative && w.AuraNative.postMessage) { w.AuraNative.postMessage(s); return true; } } catch (e) {}
+      try { if (w.flutter_inappwebview && w.flutter_inappwebview.callHandler) { w.flutter_inappwebview.callHandler('AuraNative', s); return true; } } catch (e) {}
+      try { if (w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.AuraNative) { w.webkit.messageHandlers.AuraNative.postMessage(s); return true; } } catch (e) {}
+    }
+    return false;
+  }
+  var seen; try { seen = (window.parent.__auraSent = window.parent.__auraSent || {}); } catch (e) { seen = {}; }
+  Q.forEach(function (c) { if (seen[c.id]) { return; } seen[c.id] = 1; c.t = 'cmd'; send(c); });
+})();
+</script>
+"""
+
+
+def native_on():
+    return bool(st.session_state.get("native_flag"))
+
+
+def native_enqueue(cmd):
+    ss = st.session_state
+    c = dict(cmd)
+    c["id"] = uuid.uuid4().hex[:10]
+    q = list(ss.get("native_q") or [])
+    q.append(c)
+    ss.native_q = q[-40:]
+    ss.native_sent_n = ss.get("native_sent_n", 0) + 1
+    ss.native_sent_ts = time.time()
+
+
+def native_dev_cmd(dev):
+    """Command for the phone, mirroring push(): WiZ UDP, or an HTTP webhook for everything else."""
+    if dev["proto"].startswith("Philips"):
+        if not wiz_ip_ok(dev["addr"]):
+            return None
+        r, g, b = hex_rgb(dev["color"])
+        params = {"state": bool(dev["on"]), "dimming": max(10, int(dev["lvl"])), "r": r, "g": g, "b": b}
+        return {"k": "wiz", "ip": str(dev["addr"]).strip(), "p": {"id": 1, "method": "setPilot", "params": params}}
+    url = str(dev["addr"]).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    body = {"source": "AuraSync", "device": dev["name"], "type": dev["cid"], "room": dev["room"],
+            "state": "on" if dev["on"] else "off", "level": dev["lvl"], "color": dev["color"],
+            "mode": dev.get("acmode") or dev.get("fanmode") or ""}
+    hdr = {"Authorization": "Bearer " + dev["token"]} if dev.get("token") else {}
+    return {"k": "http", "url": url, "method": "POST", "headers": hdr, "body": body}
+
+
+def render_native_out():
+    """Hand queued device commands to the iPhone app. Runs at the end of every full page run."""
+    ss = st.session_state
+    q = list(ss.get("native_q") or [])
+    if not q:
+        return
+    ss.native_q = []
+    blob = json.dumps(q, ensure_ascii=False).replace("</", "<\\/")
+    components.html(NATIVE_OUT_HTML.replace("__Q__", blob), height=0)
+
+
+def cb_native_toggle():
+    st.session_state.native_flag = bool(st.session_state.get("native_ctl_w"))
+
+
+def cb_native_test():
+    """Send the current state of every real device to the phone, plus the WiZ IP from Room Settings (a quick bulb test)."""
+    ss, cfg = st.session_state, st.session_state.cfg
+    n = 0
+    for d in ss.get("fleet") or []:
+        if d.get("proto") == "Simulation" or not d.get("addr"):
+            continue
+        d["status"] = "connected"
+        if d["cid"] in BULBLIKE:
+            d["on"], d["lvl"], d["color"] = True, max(40, int(d.get("lvl") or 60)), "#FFE4A0"
+        push(d)
+        n += 1
+    ip = str(cfg.get("wiz_ip", "")).strip()
+    if ip and wiz_fire(ip, "#FFE4A0", 60):
+        n += 1
+    ss.flash = ("📱 Sent " + str(n) + " command(s) to your phone") if n else "No real device is set up yet (add a WiZ IP or a device with an address)."
+    log(ss.flash)
+
+
+def render_native_panel():
+    ss = st.session_state
+    st.toggle("📱 Control my devices through this iPhone app", value=bool(ss.get("native_flag")), key="native_ctl_w",
+              on_change=cb_native_toggle,
+              help="Turn on when AuraSync runs inside the iPhone app. The phone then sends the light, fan and AC commands over your home Wi-Fi.")
+    rx, ts = ss.get("hr_rx", 0), ss.get("hr_rx_ts", 0)
+    b = ss.get("ble") or {}
+    if rx:
+        st.caption("📡 Phone link: " + str(rx) + " message(s) received, last " + str(int(time.time() - ts)) + " s ago, state: " +
+                   (b.get("state") or "?") + (", source: " + b["src"] if b.get("src") else "") +
+                   (", last reading " + str(b["hr"]) + " BPM" if b.get("hr") else ", no reading yet"))
+    else:
+        st.caption("📡 Phone link: nothing received from the iPhone app yet.")
+    if ss.get("native_flag"):
+        st.caption("💡 Commands sent to the phone: " + str(ss.get("native_sent_n", 0)))
+        st.button("💡 Test: send a warm light to my real devices", key="native_test_btn", on_click=cb_native_test)
+
+
 HR_BRIDGE_KEY = "aura_hr_bridge"
 HR_PH = "◈4417◈"
 
@@ -2787,8 +2903,19 @@ def cb_hr_bridge():
     if n and n == ss.get("hr_nonce"):
         return
     ss.hr_nonce = n
+    ss.hr_rx = ss.get("hr_rx", 0) + 1
+    ss.hr_rx_ts = time.time()
+    if d.get("nat") and not ss.get("native_seen"):          # first sign of the iPhone app: route device commands through it
+        ss.native_seen = True
+        ss.native_flag = True
+        ss.native_ctl_w = True
     b = dict(ss.get("ble") or {})
     b["state"] = str(d.get("st", ""))[:20]
+    b["src"] = str(d.get("src", ""))[:30]
+    try:
+        b["ttl"] = max(25, min(900, int(float(d.get("ttl") or 25))))
+    except (TypeError, ValueError):
+        b["ttl"] = 25
     b["name"] = str(d.get("name", ""))[:40]
     b["err"] = str(d.get("err", ""))[:30]
     try:
@@ -2851,6 +2978,14 @@ WEAR_HTML = """
   var w = $('w');
   $('c1').textContent = S.connect; $('c2').textContent = S.all; $('c3').textContent = S.disc; $('nt').textContent = S.note;
   function eng() { return (P && P.__aura && P.__aura.hrm) ? P.__aura : null; }
+  function natHas() {
+    var L = [window, window.parent, window.top];
+    for (var i = 0; i < L.length; i++) {
+      try { var w = L[i]; if ((w.AuraNative && w.AuraNative.postMessage) || (w.flutter_inappwebview && w.flutter_inappwebview.callHandler) ||
+            (w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.AuraNative)) { return true; } } catch (e) {}
+    }
+    return false;
+  }
   function fit() {
     try {
       var fe = window.frameElement, h = Math.ceil(w.getBoundingClientRect().height) + 8;
@@ -2867,7 +3002,7 @@ WEAR_HTML = """
   }
   function paint() {
     var a = eng(), h = a ? a.hrm : null, st = h ? h.st : 'idle', err = h ? h.err : '';
-    var hasBT = !!(P && P.navigator && P.navigator.bluetooth) || !!navigator.bluetooth;
+    var hasBT = !!(P && P.navigator && P.navigator.bluetooth) || !!navigator.bluetooth || natHas();
     var fresh = h && h.hr && (Date.now() - h.ts < 15000);
     $('bpm').innerHTML = (fresh ? h.hr : '--') + '<small> bpm</small>';
     $('heart').className = fresh ? 'beat' : '';
@@ -2910,8 +3045,9 @@ def render_wearable():
     st.caption(t("ble_sub"))
     components.html(wear_html(), height=130)
     b = ss.get("ble") or {}
-    if b.get("hr") and time.time() - b.get("ts", 0) < 25:
+    if b.get("hr") and time.time() - b.get("ts", 0) < b.get("ttl", 25):
         st.caption("💓 " + t("ble_live", n=b.get("name") or "band", hr=b["hr"]))
+    render_native_panel()
 
 
 def parse_hr_payload(d):
@@ -3057,9 +3193,9 @@ def multi_source_live():
     """Priority: Bluetooth 0x180D, page link (?hr=), bridge.py file. Returns a reading dict or None."""
     ss = st.session_state
     b = ss.get("ble") or {}
-    if b.get("hr") and time.time() - b.get("ts", 0) < 25:
+    if b.get("hr") and time.time() - b.get("ts", 0) < b.get("ttl", 25):
         return {"hr": int(b["hr"]), "hrv": rmssd(b.get("rr", [])) or 55, "spo2": 97.0, "skin": 33.5,
-                "asleep": False, "live": True, "src": "Bluetooth 0x180D"}
+                "asleep": False, "live": True, "src": b.get("src") or "Bluetooth 0x180D"}
     u = ss.get("url_hr") or {}
     if u.get("hr") and time.time() - u.get("ts", 0) < URL_HR_MAX_AGE:
         return {"hr": int(u["hr"]), "hrv": 55, "spo2": 97.0, "skin": 33.5, "asleep": False, "live": True, "src": "page link"}
@@ -3109,6 +3245,9 @@ def wiz_fire(ip, hex_color, dim):
         return False
     r, g, b = hex_rgb(hex_color)
     payload = {"id": 1, "method": "setPilot", "params": {"state": True, "dimming": max(10, min(100, int(dim))), "r": r, "g": g, "b": b}}
+    if native_on():
+        native_enqueue({"k": "wiz", "ip": str(ip).strip(), "p": payload})
+        return True
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.sendto(json.dumps(payload).encode("utf-8"), (str(ip).strip(), 38899))
@@ -3572,7 +3711,7 @@ def read_biometrics():
         return live
     if cfg["source"] == "ble":
         b = ss.get("ble") or {}
-        if b.get("hr") and time.time() - b.get("ts", 0) < 25:
+        if b.get("hr") and time.time() - b.get("ts", 0) < b.get("ttl", 25):
             return {"hr": int(b["hr"]), "hrv": rmssd(b.get("rr", [])) or 55, "spo2": 97.0, "skin": 33.5,
                     "asleep": False, "live": True}
     if cfg["source"] == "wear":
@@ -4228,7 +4367,7 @@ ENGINE_JS = r"""
     } catch (e) { MIC.state = 'idle'; return false; }
   };
   /* ---- heart-rate wearables over standard Bluetooth (Web Bluetooth, Heart Rate profile) ---- */
-  var HRM = A.hrm = { st: 'idle', name: '', hr: 0, rr: [], ts: 0, err: '', dev: null, ch: null, lastPush: 0, key: 'aura_hr_bridge', ph: '\u25c84417\u25c4' };
+  var HRM = A.hrm = { st: 'idle', name: '', hr: 0, rr: [], ts: 0, err: '', dev: null, ch: null, lastPush: 0, key: 'aura_hr_bridge', ph: '\u25c84417\u25c4', src: '', ttl: 0 };
   function hrBridge(payload) {
     var inp = document.querySelector('.st-key-' + HRM.key + ' input') || document.querySelector('input[placeholder="' + HRM.ph + '"]');
     if (!inp) { return false; }
@@ -4247,7 +4386,7 @@ ENGINE_JS = r"""
     HRM.lastPush = now;
     try {
       hrBridge(JSON.stringify({ n: now.toString(36) + Math.random().toString(36).slice(2, 5), st: HRM.st, name: HRM.name,
-                                hr: HRM.hr, rr: HRM.rr.slice(-24), err: HRM.err }));
+                                hr: HRM.hr, rr: HRM.rr.slice(-24), err: HRM.err, src: HRM.src, ttl: HRM.ttl, nat: HRM.nat ? 1 : 0 }));
     } catch (e) {}
   }
   function hrParse(e) {
@@ -4283,7 +4422,47 @@ ENGINE_JS = r"""
       setTimeout(function () { hrOpen(HRM.dev).catch(function () { retry(n + 1); }); }, 1500 * n);
     })(1);
   }
+  /* ---- iPhone app (Flutter) bridge: the app owns Bluetooth / Apple Health and feeds the readings in here ---- */
+  function natSend(m) {
+    var s = JSON.stringify(m), L = [window, window.parent, window.top];
+    for (var i = 0; i < L.length; i++) {
+      var w = L[i];
+      try { if (w.AuraNative && w.AuraNative.postMessage) { w.AuraNative.postMessage(s); return true; } } catch (e) {}
+      try { if (w.flutter_inappwebview && w.flutter_inappwebview.callHandler) { w.flutter_inappwebview.callHandler('AuraNative', s); return true; } } catch (e) {}
+      try { if (w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.AuraNative) { w.webkit.messageHandlers.AuraNative.postMessage(s); return true; } } catch (e) {}
+    }
+    return false;
+  }
+  A.nativeHR = function (o) {
+    if (typeof o === 'string') { try { o = JSON.parse(o); } catch (e) { return; } }
+    if (!o || typeof o !== 'object') { return; }
+    HRM.nat = true;
+    var st = String(o.st || (o.hr ? 'connected' : 'idle'));
+    HRM.st = st; HRM.err = String(o.err || ''); HRM.src = String(o.src || ''); HRM.ttl = Number(o.ttl) || 0;
+    if (o.name) { HRM.name = String(o.name); }
+    var hr = Number(o.hr) || 0;
+    if (hr > 25 && hr < 230) { HRM.hr = hr; HRM.ts = Date.now(); if (Array.isArray(o.rr) && o.rr.length) { HRM.rr = HRM.rr.concat(o.rr.map(Number)).slice(-60); } }
+    hrPush(true);
+  };
+  try {
+    window.auraNativeHR = A.nativeHR;
+    var T = window; while (T.parent && T.parent !== T) { T = T.parent; try { T.auraNativeHR = A.nativeHR; } catch (e) { break; } }
+    window.addEventListener('message', function (e) { var d = e && e.data; if (d && d.aura === 'hr') { A.nativeHR(d.p || d); } });
+  } catch (e) {}
+  (function hello(n) {              /* tell the page it runs inside the iPhone app, so device commands go through the phone */
+    if (n > 5) { return; }
+    setTimeout(function () {
+      var inp = document.querySelector('.st-key-' + HRM.key + ' input') || document.querySelector('input[placeholder="' + HRM.ph + '"]');
+      if (!inp) { return hello(n + 1); }
+      try {
+        var ok = false, L = [window, window.parent, window.top];
+        for (var i = 0; i < L.length; i++) { try { var w = L[i]; if ((w.AuraNative && w.AuraNative.postMessage) || (w.flutter_inappwebview && w.flutter_inappwebview.callHandler) || (w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.AuraNative)) { ok = true; } } catch (e) {} }
+        if (ok) { HRM.nat = true; hrPush(true); }
+      } catch (e) {}
+    }, 2500 * (n + 1));
+  })(0);
   A.hrConnect = function (all) {
+    if (!navigator.bluetooth && natSend({ t: 'hr_connect', all: !!all })) { HRM.st = 'connecting'; HRM.err = ''; HRM.nat = true; return; }
     if (!navigator.bluetooth) { HRM.st = 'unsupported'; HRM.err = 'unsupported'; hrPush(true); return; }
     var opts = all ? { acceptAllDevices: true, optionalServices: ['heart_rate', 'battery_service'] }
                    : { filters: [{ services: ['heart_rate'] }], optionalServices: ['battery_service'] };
@@ -4297,6 +4476,7 @@ ENGINE_JS = r"""
     });
   };
   A.hrDisconnect = function () {
+    if (HRM.nat) { natSend({ t: 'hr_disconnect' }); }
     HRM.st = 'idle'; HRM.err = '';
     try { if (HRM.dev && HRM.dev.gatt && HRM.dev.gatt.connected) { HRM.dev.gatt.disconnect(); } } catch (e) {}
     HRM.hr = 0; hrPush(true);
@@ -4364,7 +4544,7 @@ ENGINE_JS = r"""
 })();
 """
 
-ENGINE_VER = 10.5
+ENGINE_VER = 10.6
 
 HOST_BOOT = """
 <script id="eng" type="text/plain">__ENGINE__</script>
@@ -8881,6 +9061,10 @@ def render_main_dashboard():
     except Exception as e:
         log("⚠ Aura AI button skipped: " + type(e).__name__)
     audio_bootstrap()
+    try:
+        render_native_out()
+    except Exception as e:
+        log("⚠ phone bridge skipped: " + type(e).__name__)
     _cache_save()
 
 
@@ -9368,6 +9552,19 @@ def do_sign_out():
     ss["clear_cookie_runs"] = 2
 
 
+def do_delete_account():
+    """Permanently remove the signed-in user's record (email, PIN hash, birth details, devices), then sign out."""
+    ss = st.session_state
+    email = ss.get("auth_email")
+    if not email or not ss.get("del_acct_ok"):
+        return
+    try:
+        users_update(lambda users: users.pop(email, None))
+    except Exception:
+        pass
+    do_sign_out()
+
+
 def sync_user_record():
     """Keep aurasync_users.json in step with profile / language edits made inside the dashboard."""
     ss = st.session_state
@@ -9660,7 +9857,7 @@ def gate_step1():
                 '<div class="gate-sub">' + html.escape(GATE_PINNED["lang_sub"]) + '</div>', unsafe_allow_html=True)
     st.selectbox(GATE_PINNED["lang_label"], LANGS, key="lang", on_change=cb_gate_lang)
     st.button(GATE_PINNED["lang_btn"], key="gate_next1", type="primary", on_click=cb_gate_continue,
-              use_container_width=True)
+              width='stretch')
 
 
 def gate_recover():
@@ -9679,7 +9876,7 @@ def gate_recover():
     elif stage == 1:
         with st.form("gate_rec1"):
             email = st.text_input(gt("email"), key="rec_email_in")
-            go = st.form_submit_button(gt("rec_send"), type="primary", use_container_width=True)
+            go = st.form_submit_button(gt("rec_send"), type="primary", width='stretch')
         if go:
             em = (email or "").strip().lower()
             if gate_throttled():
@@ -9707,7 +9904,7 @@ def gate_recover():
             st.info(gt("rec_sent"))
         with st.form("gate_rec2"):
             code_in = st.text_input(gt("rec_code"), max_chars=4, key="rec_code_in", placeholder="••••")
-            go = st.form_submit_button(gt("rec_verify"), type="primary", use_container_width=True)
+            go = st.form_submit_button(gt("rec_verify"), type="primary", width='stretch')
         if go:
             if gate_throttled():
                 st.error(gt("err_throttled"))
@@ -9720,7 +9917,7 @@ def gate_recover():
                     st.rerun()
                 gate_note_fail()
                 st.error(gt("err_expired") if res == "expired" else gt("err_code"))
-        if st.button(gt("rec_resend"), key="gate_rec_resend", use_container_width=True):
+        if st.button(gt("rec_resend"), key="gate_rec_resend", width='stretch'):
             if gate_throttled():
                 st.error(gt("err_throttled"))
             else:
@@ -9735,7 +9932,7 @@ def gate_recover():
         with st.form("gate_rec3"):
             p1 = st.text_input(gt("rec_newpin"), type="password", max_chars=4, key="rec_pin1", placeholder="••••")
             p2 = st.text_input(gt("rec_newpin2"), type="password", max_chars=4, key="rec_pin2", placeholder="••••")
-            go = st.form_submit_button(gt("rec_save"), type="primary", use_container_width=True)
+            go = st.form_submit_button(gt("rec_save"), type="primary", width='stretch')
         if go:
             if not PIN_RX.match(p1 or ""):
                 st.error(gt("err_pin"))
@@ -9748,7 +9945,7 @@ def gate_recover():
                 st.rerun()
             else:
                 st.error(gt("err_norec"))
-    st.button(gt("rec_back"), key="gate_rec_back", on_click=cb_rec_close, use_container_width=True)
+    st.button(gt("rec_back"), key="gate_rec_back", on_click=cb_rec_close, width='stretch')
 
 
 def gate_step2():
@@ -9770,9 +9967,9 @@ def gate_step2():
         pin2 = (st.text_input(gt("pin2"), type="password", max_chars=4, key="gate_pin2", placeholder="••••")
                 if mode == "create" else None)
         go = st.form_submit_button(gt("btn_create") if mode == "create" else gt("btn_signin"), type="primary",
-                                   use_container_width=True)
+                                   width='stretch')
     if mode == "signin":
-        st.button(gt("forgot"), key="gate_forgot", on_click=cb_rec_open, use_container_width=True)
+        st.button(gt("forgot"), key="gate_forgot", on_click=cb_rec_open, width='stretch')
     if go:
         em = (email or "").strip().lower()
         if gate_throttled():
@@ -9802,7 +9999,7 @@ def gate_step2():
                 gate_note_fail()
                 st.error(gt("err_bad"))
     st.caption(gt("footer"))
-    st.button(gt("back"), key="gate_back2", on_click=cb_gate_back, use_container_width=True)
+    st.button(gt("back"), key="gate_back2", on_click=cb_gate_back, width='stretch')
 
 
 def gate_step3():
@@ -9827,8 +10024,8 @@ def gate_step3():
                           format_func=lambda x: str(x).zfill(2))
         ap = t3.selectbox("AM / PM", ["AM", "PM"], index=0 if p.get("ap", "AM") == "AM" else 1, key="gate_ap")
         pob = st.text_input(t("pob"), value=p.get("pob", ""), key="gate_pob")
-        go = st.form_submit_button(gt("cal_btn"), type="primary", use_container_width=True)
-    st.button(gt("back"), key="gate_back3", on_click=cb_gate_back, use_container_width=True)
+        go = st.form_submit_button(gt("cal_btn"), type="primary", width='stretch')
+    st.button(gt("back"), key="gate_back3", on_click=cb_gate_back, width='stretch')
     if go:
         if not name.strip() or not pob.strip():
             st.warning(t("need_fields"))
@@ -9915,7 +10112,12 @@ def gate_post_dashboard():
         st.divider()
         st.markdown('<div style="font-size:.74rem;opacity:.7;letter-spacing:.04em">🔐 <span translate="no">' +
                     html.escape(str(ss.get("auth_email") or "")) + "</span></div>", unsafe_allow_html=True)
-        st.button("Sign Out / Switch Profile", key="aura_sign_out", on_click=do_sign_out, use_container_width=True)
+        st.button("Sign Out / Switch Profile", key="aura_sign_out", on_click=do_sign_out, width='stretch')
+        with st.expander("🗑 Delete my account"):
+            st.caption("Permanently deletes your account: email, PIN, birth details and saved settings. This cannot be undone.")
+            st.checkbox("I understand this cannot be undone", key="del_acct_ok")
+            st.button("Delete my account permanently", key="del_acct_btn", on_click=do_delete_account,
+                      disabled=not st.session_state.get("del_acct_ok"), width='stretch')
     sync_user_record()
     if ss.get("pending_cookie") and ss.get("pending_cookie_runs", 0) > 0:
         components.html(cookie_script(ss.pending_cookie), height=0)
