@@ -72,5 +72,7 @@
 <string>AuraSync connects to your heart-rate band to adapt your lights, sound and climate to how you feel.</string>
 <key>NSMicrophoneUsageDescription</key>
 <string>AuraSync uses the microphone so you can speak commands to Aura AI.</string>
+<key>NSLocalNetworkUsageDescription</key>
+<string>AuraSync connects to the lights, fans and AC in your home network to adapt them to how you feel.</string>
 </dict>
 </plist>
