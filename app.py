@@ -1939,6 +1939,9 @@ def push(dev):
     """Send the device's current state to the real device (no-op for Simulation)."""
     if dev["proto"] == "Simulation" or dev["status"] != "connected" or not dev["addr"]:
         return
+    if dev["proto"] == "Home Assistant API":
+        ha_push(dev)
+        return
     if native_on():                     # the iPhone app sends the command from inside the home network
         c = native_dev_cmd(dev)
         if c:
@@ -1967,6 +1970,16 @@ def connect_device(dev):
     if native_on() and dev["proto"] != "Simulation":
         dev["status"], dev["last"] = "connected", "via phone (not verified)"
         return True
+    if dev["proto"] == "Home Assistant API":
+        ha = ha_cfg()
+        try:
+            r = requests.get(ha["url"] + "/api/states/" + str(dev["addr"]), headers={"Authorization": "Bearer " + ha["token"]},
+                             timeout=4) if ha and ha_url_safe(ha["url"]) else None
+            dev["status"] = "connected" if (r is not None and r.status_code < 400) else "offline"
+            dev["last"] = "Home Assistant answered" if dev["status"] == "connected" else "no answer from Home Assistant"
+        except Exception as e:
+            dev["status"], dev["last"] = "offline", type(e).__name__
+        return dev["status"] == "connected"
     try:
         if dev["proto"] == "Simulation":
             dev["status"], dev["last"] = "connected", "simulated device ready"
@@ -2705,7 +2718,7 @@ def connect_all():
 
 
 # ---- Saved home: devices + rooms are kept in the user's account so they are still there next time ----------
-HOME_PROTOS = ("Simulation", "Philips WiZ (UDP)", "Home Assistant / REST", "Matter over Thread/Wi-Fi")
+HOME_PROTOS = ("Simulation", "Philips WiZ (UDP)", "Home Assistant / REST", "Home Assistant API", "Matter over Thread/Wi-Fi")
 
 
 def home_to_json():
@@ -2725,7 +2738,9 @@ def home_to_json():
         spaces[n] = {"icon": sp.get("icon", "\U0001F3E0"), "type": sp.get("type", "Other"),
                      "devices": [int(u) for u in sp.get("devices", [])], "preset": sp.get("preset"),
                      "persona": sp.get("persona")}
-    return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", ""))}
+    ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
+    return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", "")),
+            "ha": {"url": str(ha.get("url", "")), "token": str(ha.get("token", ""))}}
 
 
 def home_restore():
@@ -2788,6 +2803,9 @@ def home_restore():
         ip = str(h.get("wiz_ip") or "").strip()
         if ip and wiz_ip_ok(ip):
             ss.cfg["wiz_ip"] = ip
+        ha = h.get("ha")
+        if isinstance(ha, dict) and str(ha.get("url", "")).startswith(("http://", "https://")):
+            ss.cfg["ha"] = {"url": str(ha["url"])[:300], "token": str(ha.get("token", ""))[:600]}
         return True
     except Exception:
         return False
@@ -2855,6 +2873,120 @@ SCN = {"relaxed": (68, (50, 70), 33.6, False), "active": (90, (38, 55), 34.8, Fa
        "stress": (115, (20, 32), 34.5, False), "sleep": (54, (75, 95), 32.7, True),
        "wake": (73, (48, 60), 33.8, False)}
 
+
+
+# ---- Home Assistant link: find the user's devices and control them through Home Assistant's own API ------------
+HA_DOMAINS = ("light", "fan", "climate", "switch", "water_heater", "cover", "humidifier", "media_player")
+HA_ENT_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+
+
+def ha_cfg():
+    ha = st.session_state.cfg.get("ha")
+    return ha if isinstance(ha, dict) and str(ha.get("url", "")).startswith(("http://", "https://")) and ha.get("token") else None
+
+
+def ha_save(url, token):
+    url = (url or "").strip().rstrip("/")
+    if not url.startswith(("http://", "https://")) or not (token or "").strip():
+        return False
+    st.session_state.cfg["ha"] = {"url": url[:300], "token": token.strip()[:600]}
+    return True
+
+
+def ha_url_safe(url):
+    """The server only calls public addresses (never loopback, link-local or private ones) unless AURASYNC_ALLOW_LAN=1."""
+    try:
+        host = urllib.parse.urlparse(url).hostname
+        if not host:
+            return False
+        if os.environ.get("AURASYNC_ALLOW_LAN") == "1":
+            return True
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def ha_discover():
+    """Ask Home Assistant which lights, fans, ACs and switches it knows. Returns (list, error text)."""
+    ha = ha_cfg()
+    if not ha:
+        return [], "Enter your Home Assistant address and access token first."
+    if not ha_url_safe(ha["url"]):
+        return [], ("The AuraSync server cannot reach an address inside your home. Use your Home Assistant Cloud / "
+                    "remote address (https://...), or type the device name below and your iPhone app will send the commands.")
+    try:
+        r = requests.get(ha["url"] + "/api/states", headers={"Authorization": "Bearer " + ha["token"]}, timeout=8)
+    except Exception as e:
+        return [], "Could not reach Home Assistant (" + type(e).__name__ + ")."
+    if r.status_code == 401:
+        return [], "Home Assistant refused the token. Create a new long-lived access token and try again."
+    if r.status_code >= 400:
+        return [], "Home Assistant answered with error " + str(r.status_code) + "."
+    out = []
+    try:
+        for s in r.json():
+            eid = str(s.get("entity_id", ""))
+            dom = eid.split(".")[0]
+            if dom in HA_DOMAINS and HA_ENT_RE.match(eid):
+                out.append({"entity_id": eid, "name": str((s.get("attributes") or {}).get("friendly_name") or eid)[:60], "domain": dom})
+    except Exception:
+        return [], "Home Assistant sent an answer AuraSync could not read."
+    return sorted(out, key=lambda x: (x["domain"], x["name"]))[:300], ""
+
+
+def ha_calls(dev):
+    """Service calls that put one device into its current state: [(path, body)]."""
+    ent = str(dev["addr"]).strip()
+    dom = ent.split(".")[0]
+    on, lvl = bool(dev["on"]), int(dev["lvl"])
+    if dom == "light":
+        if not on:
+            return [("light/turn_off", {"entity_id": ent})]
+        body = {"entity_id": ent, "brightness_pct": max(1, min(100, lvl))}
+        if dev["cid"] in COLOR_CIDS:
+            r, g, b = hex_rgb(dev["color"])
+            body["rgb_color"] = [r, g, b]
+        return [("light/turn_on", body)]
+    if dom == "fan":
+        pct = lvl * 20 if dev["cid"] == "fan" else lvl
+        if not on or pct <= 0:
+            return [("fan/turn_off", {"entity_id": ent})]
+        return [("fan/turn_on", {"entity_id": ent, "percentage": max(1, min(100, pct))})]
+    if dom == "climate":
+        if not on:
+            return [("climate/turn_off", {"entity_id": ent})]
+        mode = "fan_only" if dev.get("acmode") == "Fan Only" else "cool"
+        return [("climate/set_hvac_mode", {"entity_id": ent, "hvac_mode": mode}),
+                ("climate/set_temperature", {"entity_id": ent, "temperature": lvl})]
+    return [("homeassistant/" + ("turn_on" if on else "turn_off"), {"entity_id": ent})]
+
+
+def ha_push(dev):
+    ss = st.session_state
+    ha = ha_cfg()
+    if not ha or not HA_ENT_RE.match(str(dev["addr"]).strip()):
+        dev["status"], dev["last"] = "offline", "Home Assistant is not linked"
+        return
+    hdr = {"Authorization": "Bearer " + ha["token"], "Content-Type": "application/json"}
+    for path, body in ha_calls(dev):
+        url = ha["url"] + "/api/services/" + path
+        if native_on():
+            native_enqueue({"k": "http", "url": url, "method": "POST", "headers": hdr, "body": body})
+            dev["last"] = "sent to phone " + datetime.now().strftime("%H:%M:%S")
+        else:
+            try:
+                if not ha_url_safe(ha["url"]):
+                    dev["status"], dev["last"] = "offline", "turn on the iPhone app control to reach your home"
+                    return
+                requests.post(url, json=body, headers=hdr, timeout=3)
+                dev["last"] = "sent " + datetime.now().strftime("%H:%M:%S") + " via Home Assistant"
+            except Exception as e:
+                dev["status"], dev["last"] = "offline", type(e).__name__
+                return
 
 
 # ---- Phone bridge: the Flutter iPhone app sends commands to bulbs / fans / ACs inside the home network ----
@@ -2951,6 +3083,14 @@ def cb_native_test():
     log(ss.flash)
 
 
+def cb_native_setup():
+    """One tap: the iPhone app walks through every permission AuraSync needs, one system prompt after another."""
+    ss = st.session_state
+    native_enqueue({"k": "setup", "need": ["bluetooth", "localnetwork", "health", "notifications", "location", "background"]})
+    ss.flash = "✨ Setup started on your iPhone. Tap Allow on each prompt. If nothing appears, update the iPhone app."
+    log("✨ Asked the iPhone app to set up all permissions")
+
+
 def render_native_panel():
     ss = st.session_state
     st.toggle("📱 Control my devices through this iPhone app", value=bool(ss.get("native_flag")), key="native_ctl_w",
@@ -2964,6 +3104,9 @@ def render_native_panel():
                    (", last reading " + str(b["hr"]) + " BPM" if b.get("hr") else ", no reading yet"))
     else:
         st.caption("📡 Phone link: nothing received from the iPhone app yet.")
+    st.button("✨ Set up everything", key="native_setup_btn", type="primary", on_click=cb_native_setup,
+              help="Asks the iPhone app to request Bluetooth, Local Network, Health, Notifications, Location and background access one after another.")
+    st.caption("Tap Allow on each iPhone prompt. If you decline one, only the feature that needs it stays off.")
     if ss.get("native_flag"):
         st.caption("💡 Commands sent to the phone: " + str(ss.get("native_sent_n", 0)))
         st.button("💡 Test: send a warm light to my real devices", key="native_test_btn", on_click=cb_native_test)
@@ -5681,16 +5824,17 @@ def open_matter():
 # Add a device: one short popup (what is it -> how does it connect -> name + room)
 # ----------------------------------------------------------------------------
 AW_TYPES = (("bulb", "\U0001F4A1", "Light"), ("fan", "\U0001F300", "Fan"), ("ac", "\u2744", "AC"))
-AW_WIZ, AW_HUB, AW_DEMO = "wiz", "hub", "demo"
+AW_WIZ, AW_HUB, AW_DEMO, AW_HA = "wiz", "hub", "demo", "ha"
 
 
 def aw_reset():
     ss = st.session_state
-    for k in ("aw_type", "aw_how", "aw_ip", "aw_url", "aw_tok", "aw_name", "aw_room", "aw_other", "aw_err"):
+    for k in ("aw_type", "aw_how", "aw_ip", "aw_url", "aw_tok", "aw_name", "aw_room", "aw_other", "aw_err",
+              "aw_ha_url", "aw_ha_tok", "aw_ha_list", "aw_ha_msg", "aw_ha_ent", "aw_ha_man"):
         ss.pop(k, None)
 
 
-def aw_create(cid, how, ip, url, tok, name, room):
+def aw_create(cid, how, ip, url, tok, name, room, ha_ent=""):
     """Create the device, put it in the room and return (device, error)."""
     ss = st.session_state
     if cid not in CAT or room not in ss.spaces:
@@ -5701,6 +5845,13 @@ def aw_create(cid, how, ip, url, tok, name, room):
         if not wiz_ip_ok(ip):
             return None, "That does not look like a home Wi-Fi address. It should look like 192.168.1.45."
         proto, addr = "Philips WiZ (UDP)", ip
+    elif how == AW_HA:
+        ha_ent = (ha_ent or "").strip().lower()
+        if not ha_cfg():
+            return None, "Link Home Assistant first: enter its address and access token."
+        if not HA_ENT_RE.match(ha_ent):
+            return None, "Pick a device from the list, or type its Home Assistant name like light.living_room."
+        proto, addr = "Home Assistant API", ha_ent
     elif how == AW_HUB:
         url = url.strip()
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -5717,6 +5868,13 @@ def aw_create(cid, how, ip, url, tok, name, room):
     if proto != "Simulation":
         push(nd)                                   # lets the iPhone app / server reach it right away
     return nd, ""
+
+
+def found_ok(cid):
+    """True when the device list chosen in the popup belongs to the current device type."""
+    ss = st.session_state
+    want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",)}.get(cid, HA_DOMAINS)
+    return any(e["entity_id"] == ss.get("aw_ha_ent") and e["domain"] in want for e in (ss.get("aw_ha_list") or []))
 
 
 def add_wizard_body():
@@ -5743,7 +5901,8 @@ def add_wizard_body():
 
     st.markdown("**2. How does it connect?**")
     opts = ([(AW_WIZ, "Philips WiZ bulb")] if cid == "bulb" else []) + [
-        (AW_HUB, "Home Assistant or another smart-home hub"), (AW_DEMO, "Just try it first (demo device)")]
+        (AW_HA, "Home Assistant (finds my devices)"), (AW_HUB, "Other hub or webhook"),
+        (AW_DEMO, "Just try it first (demo device)")]
     st.radio("How does it connect?", [o[0] for o in opts], key="aw_how", label_visibility="collapsed",
              format_func=lambda k: dict(opts)[k])
     how = ss.get("aw_how") if ss.get("aw_how") in dict(opts) else opts[0][0]
@@ -5751,6 +5910,26 @@ def add_wizard_body():
         st.text_input("Bulb address on your home Wi-Fi", key="aw_ip", placeholder="192.168.1.45", max_chars=45,
                       help="Your router's list of connected devices shows it, named wiz_... In the WiZ app, "
                            "also switch on Allow local communication for this bulb.")
+    elif how == AW_HA:
+        ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
+        st.text_input("Home Assistant address", value=ha.get("url", ""), key="aw_ha_url",
+                      placeholder="https://xxxx.ui.nabu.casa", max_chars=300)
+        st.text_input("Access token", value=ha.get("token", ""), key="aw_ha_tok", type="password", max_chars=600,
+                      help="In Home Assistant open your profile, then Security, then Long-lived access tokens, and create one.")
+        if st.button("\U0001F50D Find my devices", key="aw_ha_find"):
+            if ha_save(ss.get("aw_ha_url") or "", ss.get("aw_ha_tok") or ""):
+                found, msg = ha_discover()
+                ss["aw_ha_list"], ss["aw_ha_msg"] = found, msg
+            else:
+                ss["aw_ha_list"], ss["aw_ha_msg"] = [], "Enter the address (starting with https://) and the access token."
+        if ss.get("aw_ha_msg"):
+            st.warning(ss["aw_ha_msg"])
+        want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",)}.get(cid, HA_DOMAINS)
+        found = [e for e in (ss.get("aw_ha_list") or []) if e["domain"] in want]
+        if found:
+            st.selectbox("Pick your device", [e["entity_id"] for e in found], key="aw_ha_ent",
+                         format_func=lambda k: next(e["name"] for e in found if e["entity_id"] == k) + "  (" + k + ")")
+        st.text_input("Or type its Home Assistant name", key="aw_ha_man", placeholder="light.living_room", max_chars=80)
     elif how == AW_HUB:
         st.text_input("Webhook address", key="aw_url", placeholder="https://...", max_chars=300)
         st.text_input("Access token (only if your hub needs one)", key="aw_tok", type="password", max_chars=300)
@@ -5765,7 +5944,8 @@ def add_wizard_body():
         st.error(ss["aw_err"])
     if st.button("\u2795 Add device", key="aw_go", type="primary", width="stretch"):
         nd, err = aw_create(cid, how, ss.get("aw_ip") or "", ss.get("aw_url") or "", ss.get("aw_tok") or "",
-                            ss.get("aw_name") or "", ss.get("aw_room") or cur)
+                            ss.get("aw_name") or "", ss.get("aw_room") or cur,
+                            (ss.get("aw_ha_man") or "").strip() or (ss.get("aw_ha_ent") if how == AW_HA and found_ok(cid) else ""))
         if err:
             ss["aw_err"] = err
             st.rerun(scope="fragment")
@@ -7244,6 +7424,8 @@ def page_fleet():
                                  key=rk, on_change=cb_dev_room, args=(uid, rk), format_func=tr_room)
                     if "Matter" in dv["proto"]:
                         st.caption("🟢 Matter · " + t("s_ok"))
+                    elif dv["proto"] == "Home Assistant API":
+                        st.caption("🏠 Home Assistant · " + str(dv["addr"]))
                     else:
                         protos = PROTOS_BULB if dv["cid"] == "bulb" else PROTOS
                         pk = "fl_proto_" + str(uid)
@@ -7271,6 +7453,39 @@ def page_fleet():
         html_table(rows)
 
 
+def cb_ha_unlink():
+    ss = st.session_state
+    ss.cfg.pop("ha", None)                       # the saved address and token leave the account record on the next save
+    for d in ss.get("fleet") or []:
+        if d.get("proto") == "Home Assistant API":
+            d["status"], d["last"] = "not connected", "Home Assistant was unlinked"
+    ss.flash = "Home Assistant unlinked. Your Home Assistant devices stay listed; link it again to use them."
+
+
+def cb_ha_test():
+    found, msg = ha_discover()
+    st.session_state["ha_test"] = ("bad", msg) if msg else ("ok", "Connected. Home Assistant shows " + str(len(found)) + " devices AuraSync can control.")
+
+
+def render_ha_link_card():
+    ss = st.session_state
+    ha = ha_cfg()
+    st.markdown("**\U0001F3E0 Home Assistant**")
+    if not ha:
+        st.caption("Not linked yet. Tap Add a device, choose a device type, then Home Assistant (finds my devices).")
+        if st.button("\u2795 Add a device", key="ha_card_add"):
+            open_add_wizard()
+        return
+    st.caption("Linked to your AuraSync account (" + str(ss.get("auth_email") or "this session") + ") at " + ha["url"] +
+               ". Alexa and Google Home devices that you share into Home Assistant appear in its device list.")
+    b1, b2 = st.columns(2)
+    b1.button("Test connection", key="ha_test_btn", on_click=cb_ha_test)
+    b2.button("Unlink Home Assistant", key="ha_unlink_btn", on_click=cb_ha_unlink)
+    res = ss.get("ha_test")
+    if res:
+        (st.success if res[0] == "ok" else st.warning)(res[1])
+
+
 def page_system():
     ss, cfg = st.session_state, st.session_state.cfg
     st.header(t("p5"))
@@ -7278,6 +7493,7 @@ def page_system():
     cfg["api_token"] = st.text_input(t("api_token"), value=cfg.get("api_token", ""), type="password", key="api_token_w")
     render_wearables_hub()
     render_wearable()
+    render_ha_link_card()
     c1, c2, c3, c4 = st.columns(4)
     cfg["thr"] = c1.slider(t("thr"), 85, 150, int(cfg["thr"]))
     cfg["rel"] = c2.slider(t("rel"), 55, 95, int(cfg["rel"]))
