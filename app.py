@@ -2791,7 +2791,9 @@ NATIVE_OUT_HTML = """
 
 
 def native_on():
-    return bool(st.session_state.get("native_flag"))
+    """Route device commands through the iPhone app. Only while you are home: away, the phone cannot reach the LAN and the cloud relay is used."""
+    ss = st.session_state
+    return bool(ss.get("native_flag")) and (ss.get("conn") or {}).get("mode", "home") == "home"
 
 
 def native_enqueue(cmd):
