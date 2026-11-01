@@ -34,10 +34,28 @@ class AuraHome extends StatefulWidget {
   State<AuraHome> createState() => _AuraHomeState();
 }
 
+/// Progress of one step in the "Set up everything" sheet.
+enum _Stage { waiting, running, ok, warn }
+
+class _SetupStep {
+  _SetupStep(this.title, this.why);
+  final String title;
+  final String why;
+  _Stage stage = _Stage.waiting;
+  String note = '';
+}
+
+class _Res {
+  const _Res(this.ok, this.note);
+  final bool ok;
+  final String note;
+}
+
 class _AuraHomeState extends State<AuraHome> {
   late final WebViewController _web;
   bool _loading = true;
   bool _failed = false;
+  bool _setupRunning = false;
 
   // Bluetooth heart-rate state
   static final Guid _hrService = Guid('180D');
@@ -123,7 +141,12 @@ class _AuraHomeState extends State<AuraHome> {
         await _disconnect();
         break;
       case 'cmd':
-        await _runCommand(msg);
+        if (msg['k'] == 'setup') {
+          // The "Set up everything" button on the page.
+          if (mounted) unawaited(_startSetup());
+        } else {
+          await _runCommand(msg);
+        }
         break;
     }
   }
@@ -170,6 +193,88 @@ class _AuraHomeState extends State<AuraHome> {
     } catch (_) {
       // A bulb that is offline must never crash the app.
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // "Set up everything": one sheet, the iPhone permission prompts one after another
+  // ---------------------------------------------------------------------------
+  Future<_Res> _setupBluetooth() async {
+    try {
+      final s = await FlutterBluePlus.adapterState
+          .firstWhere((x) => x != BluetoothAdapterState.unknown)
+          .timeout(const Duration(seconds: 12));
+      if (s == BluetoothAdapterState.unauthorized) {
+        return const _Res(false, 'Blocked. Open iPhone Settings, AuraSync, and switch Bluetooth on.');
+      }
+      if (s == BluetoothAdapterState.off) {
+        return const _Res(false, 'Bluetooth is switched off. Turn it on in Control Centre.');
+      }
+      if (s == BluetoothAdapterState.on) {
+        return const _Res(true, 'Ready to find your heart-rate band.');
+      }
+      return const _Res(false, 'Bluetooth is not available on this device.');
+    } catch (_) {
+      return const _Res(false, 'No answer from Bluetooth. Try again.');
+    }
+  }
+
+  Future<_Res> _setupLocalNetwork() async {
+    try {
+      String? ip;
+      final ifs = await NetworkInterface.list(type: InternetAddressType.IPv4);
+      for (final i in ifs) {
+        if (i.name != 'en0') continue; // Wi-Fi
+        for (final a in i.addresses) {
+          if (_isPrivateHost(a.address)) ip = a.address;
+        }
+      }
+      if (ip == null) {
+        return const _Res(false, 'Join your home Wi-Fi, then tap Set up everything again.');
+      }
+      // A harmless packet to the router makes iPhone ask for Local Network access.
+      final p = ip.split('.');
+      p[3] = '1';
+      final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      sock.send(utf8.encode('aurasync'), InternetAddress(p.join('.')), 9);
+      await Future.delayed(const Duration(seconds: 2));
+      sock.close();
+      return const _Res(true, 'Done. If iPhone asked, you tapped Allow.');
+    } catch (_) {
+      return const _Res(false, 'Could not reach your home network.');
+    }
+  }
+
+  Future<void> _startSetup() async {
+    if (_setupRunning || !mounted) return;
+    _setupRunning = true;
+    final steps = <_SetupStep>[
+      _SetupStep('Bluetooth', 'Finds your heart-rate band'),
+      _SetupStep('Home network', 'Lets AuraSync reach your lights, fan and AC'),
+    ];
+    final tick = ValueNotifier<int>(0);
+    final actions = <Future<_Res> Function()>[_setupBluetooth, _setupLocalNetwork];
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF12141A),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => ValueListenableBuilder<int>(
+        valueListenable: tick,
+        builder: (_, __, ___) => _SetupSheet(steps: steps),
+      ),
+    );
+
+    for (var i = 0; i < steps.length; i++) {
+      steps[i].stage = _Stage.running;
+      tick.value++;
+      final r = await actions[i]();
+      steps[i].stage = r.ok ? _Stage.ok : _Stage.warn;
+      steps[i].note = r.note;
+      tick.value++;
+    }
+    _setupRunning = false;
+    await _push();
   }
 
   // ---- Push a reading into the hidden field the Streamlit app already watches
@@ -346,6 +451,55 @@ class _AuraHomeState extends State<AuraHome> {
                     : const Icon(Icons.favorite_border),
               ),
             ),
+    );
+  }
+}
+
+/// The "Set up everything" progress sheet.
+class _SetupSheet extends StatelessWidget {
+  const _SetupSheet({required this.steps});
+  final List<_SetupStep> steps;
+
+  Widget _icon(_Stage s) {
+    switch (s) {
+      case _Stage.ok:
+        return const Icon(Icons.check_circle, color: kGold);
+      case _Stage.warn:
+        return const Icon(Icons.error_outline, color: Colors.orangeAccent);
+      case _Stage.running:
+        return const SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(strokeWidth: 2, color: kGold));
+      case _Stage.waiting:
+        return const Icon(Icons.radio_button_unchecked, color: Colors.white38);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final done = steps.every((s) => s.stage == _Stage.ok || s.stage == _Stage.warn);
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Getting AuraSync ready',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: kGold)),
+        const SizedBox(height: 4),
+        const Text('Tap Allow when iPhone asks.', style: TextStyle(color: Colors.white70)),
+        const SizedBox(height: 12),
+        for (final s in steps)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: _icon(s.stage),
+            title: Text(s.title),
+            subtitle: Text(s.note.isEmpty ? s.why : s.note),
+          ),
+        if (done)
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton(onPressed: () => Navigator.pop(context), child: const Text('Done')),
+          ),
+      ]),
     );
   }
 }
