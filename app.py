@@ -2704,6 +2704,95 @@ def connect_all():
     log("🔗 Connected " + str(ok) + " of " + str(len(ss.fleet)) + " devices")
 
 
+# ---- Saved home: devices + rooms are kept in the user's account so they are still there next time ----------
+HOME_PROTOS = ("Simulation", "Philips WiZ (UDP)", "Home Assistant / REST", "Matter over Thread/Wi-Fi")
+
+
+def home_to_json():
+    """Structural part of the home (what exists and how to reach it). Live on/off state is not saved."""
+    ss = st.session_state
+    if "fleet" not in ss or not ss.get("spaces"):
+        return None
+    devs = []
+    for d in ss.fleet:
+        r = {k: d.get(k, "") for k in ("uid", "cid", "name", "room", "proto", "addr", "token")}
+        for k in ("acmode", "fanmode"):
+            if isinstance(d.get(k), str):
+                r[k] = d[k]
+        devs.append(r)
+    spaces = {}
+    for n, sp in ss.spaces.items():
+        spaces[n] = {"icon": sp.get("icon", "\U0001F3E0"), "type": sp.get("type", "Other"),
+                     "devices": [int(u) for u in sp.get("devices", [])], "preset": sp.get("preset"),
+                     "persona": sp.get("persona")}
+    return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", ""))}
+
+
+def home_restore():
+    """Rebuild ss.fleet / ss.spaces from the saved home. Returns False (and changes nothing) if nothing usable is saved."""
+    ss = st.session_state
+    h = ss.get("_home_saved")
+    if not isinstance(h, dict):
+        return False
+    try:
+        raw_devs, raw_sp = h.get("devices"), h.get("spaces")
+        if not isinstance(raw_devs, list) or not isinstance(raw_sp, dict) or not raw_devs:
+            return False
+        if not all(isinstance(raw_sp.get(n), dict) for n in PROTECTED_SPACES):
+            return False
+        ss.uid = 0
+        fleet, seen = [], set()
+        for r in raw_devs:
+            if not isinstance(r, dict):
+                continue
+            cid, uid = r.get("cid"), r.get("uid")
+            if cid not in CAT or not isinstance(uid, int) or isinstance(uid, bool) or uid in seen:
+                continue
+            seen.add(uid)
+            d = new_device(cid, str(r.get("name") or CAT[cid][2])[:40], str(r.get("room") or "")[:40])
+            d["uid"] = uid
+            proto = r.get("proto")
+            if proto in HOME_PROTOS:
+                d["proto"] = proto
+            d["addr"], d["token"] = str(r.get("addr") or "")[:300], str(r.get("token") or "")[:300]
+            for k in ("acmode", "fanmode"):
+                if isinstance(r.get(k), str):
+                    d[k] = r[k][:30]
+            if d["proto"] != "Simulation":
+                d["last"] = "restored from your account"
+            fleet.append(d)
+        if not fleet:
+            return False
+        spaces = {}
+        for n, sp in raw_sp.items():
+            if not isinstance(n, str) or not isinstance(sp, dict):
+                continue
+            pre = sp.get("preset")
+            clean = None
+            if isinstance(pre, dict):
+                clean = {}
+                for k, v in pre.items():
+                    if str(k).isdigit() and int(k) in seen and isinstance(v, dict):
+                        try:
+                            clean[str(int(k))] = {"on": bool(v.get("on")), "lvl": int(v.get("lvl", 0)),
+                                                  "color": safe_hex(v.get("color"))}
+                        except (TypeError, ValueError):
+                            pass
+                clean = clean or None
+            spaces[n[:40]] = {"icon": str(sp.get("icon") or "\U0001F3E0")[:8], "type": str(sp.get("type") or "Other")[:20],
+                              "devices": [u for u in dict.fromkeys(sp.get("devices") or []) if u in seen],
+                              "preset": clean,
+                              "persona": sp.get("persona") if sp.get("persona") in ("personal", "shared") else None}
+        ss.fleet, ss.spaces = fleet, spaces
+        ss.uid = max([ss.uid] + list(seen))
+        ip = str(h.get("wiz_ip") or "").strip()
+        if ip and wiz_ip_ok(ip):
+            ss.cfg["wiz_ip"] = ip
+        return True
+    except Exception:
+        return False
+
+
 def init_state():
     ss = st.session_state
     if ss.get("theme_choice") not in ("dark", "light"):
@@ -2724,25 +2813,28 @@ def init_state():
     if "fleet" not in ss:
         ss.uid = 0
         ss.log = []
-        ss.fleet = []
-        ss.spaces = {}
-        for room, (icon, typ, devs) in DEFAULT_SPACES.items():
-            ids = []
-            for cid, label in devs:
-                d = new_device(cid, label + " · " + room, room)
-                ss.fleet.append(d)
-                ids.append(d["uid"])
-            ss.spaces[room] = {"icon": icon, "type": typ, "devices": ids, "preset": None}
-        ss.active_mode = "Relax Evening"
-        apply_mode(ss.active_mode)
-        # Pre-fill every predefined room's one-click default
-        keep = {d["uid"]: (d["on"], d["lvl"], d["color"]) for d in ss.fleet}
-        apply_mode(ss.active_mode, why=False, devs=list(ss.fleet), set_active=False)
-        for room in ss.spaces:
-            snapshot_room(room)
-        for d in ss.fleet:
-            d["on"], d["lvl"], d["color"] = keep[d["uid"]]
-        ss.log = []
+        if home_restore():                       # this user's saved devices and rooms: nothing is sent to the real devices here
+            ss.active_mode = "Relax Evening"
+        else:
+            ss.fleet = []
+            ss.spaces = {}
+            for room, (icon, typ, devs) in DEFAULT_SPACES.items():
+                ids = []
+                for cid, label in devs:
+                    d = new_device(cid, label + " · " + room, room)
+                    ss.fleet.append(d)
+                    ids.append(d["uid"])
+                ss.spaces[room] = {"icon": icon, "type": typ, "devices": ids, "preset": None}
+            ss.active_mode = "Relax Evening"
+            apply_mode(ss.active_mode)
+            # Pre-fill every predefined room's one-click default
+            keep = {d["uid"]: (d["on"], d["lvl"], d["color"]) for d in ss.fleet}
+            apply_mode(ss.active_mode, why=False, devs=list(ss.fleet), set_active=False)
+            for room in ss.spaces:
+                snapshot_room(room)
+            for d in ss.fleet:
+                d["on"], d["lvl"], d["color"] = keep[d["uid"]]
+            ss.log = []
     for k, v in (("hr_hist", [72 + random.randint(-3, 3) for _ in range(30)]), ("skin_hist", []),
                  ("bstate", "relaxed"), ("last_state", None), ("wake_ticks", 0), ("sleep_ts", 0.0), ("prev_auto", False),
                  ("flash", ""), ("profile", None), ("editing", False), ("chat", []), ("chimed", False),
@@ -3576,6 +3668,8 @@ def render_manual_controls():
                            on_click=cb_mc, args=(fan["uid"], "fanp", name))
         else:
             st.caption(zt("zk_nodev", d=zt("zk_fan")))
+    if st.button("\u2795 Add a device", key="zk_aw_open"):
+        open_add_wizard()
     with st.expander(zt("zk_endp")):
         with st.form("ep_form_" + room):
             st.text_input(zt("zk_wiz"), value=str(cfg.get("wiz_ip", "")), key="ep_wiz", max_chars=45)
@@ -5584,6 +5678,113 @@ def open_matter():
 
 
 # ----------------------------------------------------------------------------
+# Add a device: one short popup (what is it -> how does it connect -> name + room)
+# ----------------------------------------------------------------------------
+AW_TYPES = (("bulb", "\U0001F4A1", "Light"), ("fan", "\U0001F300", "Fan"), ("ac", "\u2744", "AC"))
+AW_WIZ, AW_HUB, AW_DEMO = "wiz", "hub", "demo"
+
+
+def aw_reset():
+    ss = st.session_state
+    for k in ("aw_type", "aw_how", "aw_ip", "aw_url", "aw_tok", "aw_name", "aw_room", "aw_other", "aw_err"):
+        ss.pop(k, None)
+
+
+def aw_create(cid, how, ip, url, tok, name, room):
+    """Create the device, put it in the room and return (device, error)."""
+    ss = st.session_state
+    if cid not in CAT or room not in ss.spaces:
+        return None, "Pick a device type and a room."
+    proto, addr, token = "Simulation", "", ""
+    if how == AW_WIZ:
+        ip = ip.strip()
+        if not wiz_ip_ok(ip):
+            return None, "That does not look like a home Wi-Fi address. It should look like 192.168.1.45."
+        proto, addr = "Philips WiZ (UDP)", ip
+    elif how == AW_HUB:
+        url = url.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return None, "The webhook address must start with http:// or https://"
+        proto, addr, token = "Home Assistant / REST", url[:300], tok.strip()[:300]
+    nd = new_device(cid, unique_name((name or "").strip()[:40] or CAT[cid][2]), room)
+    nd["proto"], nd["addr"], nd["token"] = proto, addr, token
+    nd["status"] = "connected"
+    nd["last"] = "added just now" if proto != "Simulation" else "demo device ready"
+    ss.fleet.append(nd)
+    ss.spaces[room]["devices"].append(nd["uid"])
+    ss.room_rev = ss.get("room_rev", 0) + 1
+    log("\u2795 " + nd["name"] + " added to " + room)
+    if proto != "Simulation":
+        push(nd)                                   # lets the iPhone app / server reach it right away
+    return nd, ""
+
+
+def add_wizard_body():
+    ss = st.session_state
+    st.markdown("**1. What are you adding?**")
+    cols = st.columns(4)
+    for col, (cid, icon, label) in zip(cols, AW_TYPES):
+        if col.button(icon + " " + label, key="aw_t_" + cid, width="stretch",
+                      type="primary" if ss.get("aw_type") == cid else "secondary"):
+            ss["aw_type"] = cid
+    if cols[3].button("\u2795 Other", key="aw_t_other", width="stretch",
+                      type="primary" if ss.get("aw_type") == "other" else "secondary"):
+        ss["aw_type"] = "other"
+    typ = ss.get("aw_type")
+    if typ == "other":
+        others = [k for k in CAT if k not in ("bulb", "fan", "ac")]
+        st.selectbox("Device type", others, key="aw_other", format_func=lambda k: CAT[k][1] + " " + CAT[k][2])
+        cid = ss.get("aw_other") if ss.get("aw_other") in CAT else others[0]
+    else:
+        cid = typ
+    if cid not in CAT:
+        st.caption("Tap the kind of device you want to add.")
+        return
+
+    st.markdown("**2. How does it connect?**")
+    opts = ([(AW_WIZ, "Philips WiZ bulb")] if cid == "bulb" else []) + [
+        (AW_HUB, "Home Assistant or another smart-home hub"), (AW_DEMO, "Just try it first (demo device)")]
+    st.radio("How does it connect?", [o[0] for o in opts], key="aw_how", label_visibility="collapsed",
+             format_func=lambda k: dict(opts)[k])
+    how = ss.get("aw_how") if ss.get("aw_how") in dict(opts) else opts[0][0]
+    if how == AW_WIZ:
+        st.text_input("Bulb address on your home Wi-Fi", key="aw_ip", placeholder="192.168.1.45", max_chars=45,
+                      help="Your router's list of connected devices shows it, named wiz_... In the WiZ app, "
+                           "also switch on Allow local communication for this bulb.")
+    elif how == AW_HUB:
+        st.text_input("Webhook address", key="aw_url", placeholder="https://...", max_chars=300)
+        st.text_input("Access token (only if your hub needs one)", key="aw_tok", type="password", max_chars=300)
+
+    st.markdown("**3. Name and room**")
+    rooms = list(ss.spaces)
+    c1, c2 = st.columns(2)
+    c1.text_input("Name", key="aw_name", placeholder=CAT[cid][2], max_chars=40)
+    cur = current_room()
+    c2.selectbox("Room", rooms, key="aw_room", index=rooms.index(cur) if cur in rooms else 0, format_func=tr_room)
+    if ss.get("aw_err"):
+        st.error(ss["aw_err"])
+    if st.button("\u2795 Add device", key="aw_go", type="primary", width="stretch"):
+        nd, err = aw_create(cid, how, ss.get("aw_ip") or "", ss.get("aw_url") or "", ss.get("aw_tok") or "",
+                            ss.get("aw_name") or "", ss.get("aw_room") or cur)
+        if err:
+            ss["aw_err"] = err
+            st.rerun(scope="fragment")
+        aw_reset()
+        ss.flash = "\u2705 " + nd["name"] + " added to " + tr_room(nd["room"]) + ". It is saved to your account."
+        st.rerun()
+
+
+def open_add_wizard():
+    aw_reset()
+    title = "Add a device"
+    if hasattr(st, "dialog"):
+        st.dialog(title)(add_wizard_body)()
+    else:
+        with st.expander(title, expanded=True):
+            add_wizard_body()
+
+
+# ----------------------------------------------------------------------------
 # Page 6 - Room Settings, Remote Access & Smart Geofence
 # ----------------------------------------------------------------------------
 def cb_power(uid, key):
@@ -5750,6 +5951,8 @@ def render_room_settings():
     if pre:
         st.caption(t("rs_preset_has", c=len(pre)))
 
+    if st.button("\u2795 Add a device", key="rs_aw_open", type="primary"):
+        open_add_wizard()
     with st.expander(t("rs_devices"), expanded=True):
         if not devs:
             st.caption(t("room_empty"))
@@ -6998,7 +7201,9 @@ def page_fleet():
     h3.markdown(stat(t("ai_auto"), t("mode_auto").split(" (")[0] if ss.cfg["auto_mode"] else t("mode_manual")),
                 unsafe_allow_html=True)
     st.caption(t("dev_hint"))
-    if st.button(t("matter_btn"), key="mt_open", type="primary"):
+    if st.button("\u2795 Add a device", key="fl_aw_open", type="primary"):
+        open_add_wizard()
+    if st.button(t("matter_btn"), key="mt_open"):
         open_matter()
     if pro:
         b1, b2 = st.columns(2)
@@ -9384,6 +9589,10 @@ def load_user_into_session(email, u):
     prefs = u.get("prefs") if isinstance(u.get("prefs"), dict) else {}
     if prefs.get("theme") in ("dark", "light") and "theme_choice" not in ss:
         ss["theme_choice"] = prefs["theme"]
+    home = u.get("home") if isinstance(u.get("home"), dict) else None
+    ss["_home_saved"] = home
+    if home and "fleet" in ss:                   # an earlier anonymous run built the defaults: rebuild from the account
+        del ss["fleet"]
 
 
 def issue_device_token(email):
@@ -9577,7 +9786,8 @@ def sync_user_record():
     ss.gate_lang = lang
     pj = profile_to_json(prof) if prof else None
     theme = ss.get("theme_choice") if ss.get("theme_choice") in ("dark", "light") else None
-    sig = json.dumps([pj, lang, theme], sort_keys=True, default=str)
+    hj = home_to_json()
+    sig = json.dumps([pj, lang, theme, hj], sort_keys=True, default=str)
     if sig == ss.get("_user_sig"):
         return
     ss._user_sig = sig
@@ -9588,6 +9798,8 @@ def sync_user_record():
             u["lang"], u["profile"] = lang, pj
             if theme:
                 u.setdefault("prefs", {})["theme"] = theme
+            if hj is not None:
+                u["home"] = hj
     users_update(op)
 
 
