@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -56,12 +57,21 @@ class _AuraHomeState extends State<AuraHome> {
     _web = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(kObsidian)
+      // The page talks to the phone through this channel (see FLUTTER_BRIDGE.md):
+      // device commands, and the heart-rate button on the page.
+      ..addJavaScriptChannel('AuraNative', onMessageReceived: _onAuraMessage)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) => setState(() {
           _loading = true;
           _failed = false;
         }),
-        onPageFinished: (_) => setState(() => _loading = false),
+        onPageFinished: (_) {
+          setState(() => _loading = false);
+          // Tell the page it is running inside the iPhone app, so it sends
+          // light / fan / AC commands to this phone instead of the cloud server.
+          Future.delayed(const Duration(seconds: 4), _push);
+          Future.delayed(const Duration(seconds: 12), _push);
+        },
         onWebResourceError: (e) {
           if (e.isForMainFrame ?? true) {
             setState(() {
@@ -95,6 +105,73 @@ class _AuraHomeState extends State<AuraHome> {
     super.dispose();
   }
 
+  // ---------------------------------------------------------------------------
+  // Messages from the page
+  // ---------------------------------------------------------------------------
+  Future<void> _onAuraMessage(JavaScriptMessage m) async {
+    Map<String, dynamic> msg;
+    try {
+      msg = jsonDecode(m.message) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+    switch (msg['t']) {
+      case 'hr_connect':
+        if (mounted) _openPicker();
+        break;
+      case 'hr_disconnect':
+        await _disconnect();
+        break;
+      case 'cmd':
+        await _runCommand(msg);
+        break;
+    }
+  }
+
+  /// Only addresses inside a home network (or *.local names) may receive plain commands.
+  bool _isPrivateHost(String host) {
+    if (host.endsWith('.local')) return true;
+    final a = InternetAddress.tryParse(host);
+    if (a == null || a.type != InternetAddressType.IPv4) return false;
+    final b = a.rawAddress;
+    return b[0] == 10 ||
+        (b[0] == 192 && b[1] == 168) ||
+        (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+        (b[0] == 169 && b[1] == 254);
+  }
+
+  Future<void> _runCommand(Map<String, dynamic> c) async {
+    try {
+      if (c['k'] == 'wiz') {
+        final ip = '${c['ip']}';
+        if (!_isPrivateHost(ip)) return;
+        final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+        sock.send(utf8.encode(jsonEncode(c['p'])), InternetAddress(ip), 38899);
+        await Future.delayed(const Duration(milliseconds: 150));
+        sock.close();
+      } else if (c['k'] == 'http') {
+        final uri = Uri.parse('${c['url']}');
+        final plain = uri.scheme == 'http';
+        if (plain && !_isPrivateHost(uri.host)) return; // never plain http to the internet
+        if (!plain && uri.scheme != 'https') return;
+        final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
+        final req = await client.openUrl(
+            '${c['method'] ?? 'POST'}'.toUpperCase(), uri);
+        req.headers.contentType = ContentType.json;
+        final hdr = c['headers'];
+        if (hdr is Map) {
+          hdr.forEach((k, v) => req.headers.set('$k', '$v'));
+        }
+        req.add(utf8.encode(jsonEncode(c['body'] ?? {})));
+        final res = await req.close();
+        await res.drain<void>();
+        client.close();
+      }
+    } catch (_) {
+      // A bulb that is offline must never crash the app.
+    }
+  }
+
   // ---- Push a reading into the hidden field the Streamlit app already watches
   // (same JSON contract as its Web Bluetooth path: {n, st, name, hr, rr, err}).
   Future<void> _push({int hr = 0, String? err}) async {
@@ -105,6 +182,8 @@ class _AuraHomeState extends State<AuraHome> {
       'hr': hr,
       'rr': List<int>.from(_rr),
       'err': err ?? '',
+      'src': 'Bluetooth 0x180D',
+      'nat': 1, // "I am the iPhone app": the page then routes device commands through this phone
     };
     final js = '''
 (function(p){
