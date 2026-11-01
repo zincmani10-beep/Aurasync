@@ -66,13 +66,23 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-<key>ITSAppUsesNonExemptEncryption</key>
-<false/>
-<key>NSBluetoothAlwaysUsageDescription</key>
-<string>AuraSync connects to your heart-rate band to adapt your lights, sound and climate to how you feel.</string>
-<key>NSMicrophoneUsageDescription</key>
-<string>AuraSync uses the microphone so you can speak commands to Aura AI.</string>
-<key>NSLocalNetworkUsageDescription</key>
-<string>AuraSync connects to the lights, fans and AC in your home network to adapt them to how you feel.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>AuraSync connects to your heart-rate band to adapt your lights, sound and climate to how you feel.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>AuraSync uses the microphone so you can speak commands to Aura AI.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>AuraSync connects to the lights, fans and AC in your home network to adapt them to how you feel.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>AuraSync reads your heart rate from Apple Health so it can adapt your lights, sound and climate to how you feel. It never writes to Health.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>AuraSync uses your location to know when you are close to home and which room you are in.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>AuraSync uses your location in the background to get your home ready before you arrive.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>
