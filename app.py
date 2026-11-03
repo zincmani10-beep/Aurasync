@@ -87,7 +87,7 @@ T = {
     "p3": ("Inner Voice & Guide", "உள்மனக் குரல் & வழிகாட்டி", "내면의 목소리 & 가이드", "เสียงภายในและคู่มือ", "Voz Interior y Guía"),
     "p4": ("Device Fleet", "சாதனக் குழு", "디바이스 플릿", "กลุ่มอุปกรณ์", "Flota de Dispositivos"),
     "p5": ("System Settings", "கணினி அமைப்புகள்", "시스템 설정", "การตั้งค่าระบบ", "Ajustes del Sistema"),
-    "p6": ("Room Settings, Remote Access & Smart Geofence", "அறை அமைப்புகள், தொலைதூர கட்டுப்பாடு & ஜியோஃபென்ஸ்", "방 설정, 원격 액세스 & 스마트 지오펜스", "การตั้งค่าห้อง การเข้าถึงระยะไกล & สมาร์ทจีโอเฟนซ์", "Configuración de Habitación, Acceso Remoto y Geocerca Inteligente"),
+    "p6": ("Devices & Body Sensors", "சாதனங்கள் & உடல் உணர்வி", "기기 및 바이오 센서", "อุปกรณ์และเซนเซอร์ร่างกาย", "Dispositivos y Sensores"),
     "mode_sel": ("Control mode", "கட்டுப்பாட்டு முறை", "제어 모드", "โหมดควบคุม", "Modo de control"),
     "mode_manual": ("Manual Mode", "கைமுறை பயன்முறை", "수동 모드", "โหมดแมนนวล", "Modo Manual"),
     "mode_auto": ("Auto Mode (Wearable Biometric Sync)", "தானியங்கு பயன்முறை (அணிகலன் உயிரியல் ஒத்திசைவு)", "자동 모드 (웨어러블 바이오 동기화)", "โหมดอัตโนมัติ (ซิงค์ข้อมูลชีวภาพจากอุปกรณ์สวมใส่)", "Modo Automático (Sincronización Biométrica)"),
@@ -2740,7 +2740,8 @@ def home_to_json():
                      "persona": sp.get("persona")}
     ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
     return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", "")),
-            "ha": {"url": str(ha.get("url", "")), "token": str(ha.get("token", ""))}}
+            "ha": {"url": str(ha.get("url", "")), "token": str(ha.get("token", ""))},
+            "always": alw_clean(ss.cfg.get("always"))}
 
 
 def home_restore():
@@ -2803,6 +2804,8 @@ def home_restore():
         ip = str(h.get("wiz_ip") or "").strip()
         if ip and wiz_ip_ok(ip):
             ss.cfg["wiz_ip"] = ip
+        if isinstance(h.get("always"), dict):
+            ss.cfg["always"] = alw_clean(h["always"])
         ha = h.get("ha")
         if isinstance(ha, dict) and str(ha.get("url", "")).startswith(("http://", "https://")):
             ss.cfg["ha"] = {"url": str(ha["url"])[:300], "token": str(ha.get("token", ""))[:600]}
@@ -2910,7 +2913,7 @@ def ha_url_safe(url):
         return False
 
 
-def ha_discover():
+def ha_discover(domains=None):
     """Ask Home Assistant which lights, fans, ACs and switches it knows. Returns (list, error text)."""
     ha = ha_cfg()
     if not ha:
@@ -2931,7 +2934,7 @@ def ha_discover():
         for s in r.json():
             eid = str(s.get("entity_id", ""))
             dom = eid.split(".")[0]
-            if dom in HA_DOMAINS and HA_ENT_RE.match(eid):
+            if dom in (domains or HA_DOMAINS) and HA_ENT_RE.match(eid):
                 out.append({"entity_id": eid, "name": str((s.get("attributes") or {}).get("friendly_name") or eid)[:60], "domain": dom})
     except Exception:
         return [], "Home Assistant sent an answer AuraSync could not read."
@@ -2962,6 +2965,8 @@ def ha_calls(dev):
         mode = "fan_only" if dev.get("acmode") == "Fan Only" else "cool"
         return [("climate/set_hvac_mode", {"entity_id": ent, "hvac_mode": mode}),
                 ("climate/set_temperature", {"entity_id": ent, "temperature": lvl})]
+    if dom == "cover":
+        return [("cover/set_cover_position", {"entity_id": ent, "position": max(0, min(100, lvl))})]
     return [("homeassistant/" + ("turn_on" if on else "turn_off"), {"entity_id": ent})]
 
 
@@ -3139,6 +3144,9 @@ def cb_hr_bridge():
     n = str(d.get("n", ""))[:40]
     if n and n == ss.get("hr_nonce"):
         return
+    if isinstance(d.get("wiz"), list):
+        ss["wiz_found"] = [x for x in (str(v)[:15] for v in d["wiz"][:40]) if wiz_ip_ok(x)]
+        ss["wiz_scanning"] = False
     ss.hr_nonce = n
     ss.hr_rx = ss.get("hr_rx", 0) + 1
     ss.hr_rx_ts = time.time()
@@ -5829,7 +5837,7 @@ AW_WIZ, AW_HUB, AW_DEMO, AW_HA = "wiz", "hub", "demo", "ha"
 
 def aw_reset():
     ss = st.session_state
-    for k in ("aw_type", "aw_how", "aw_ip", "aw_url", "aw_tok", "aw_name", "aw_room", "aw_other", "aw_err",
+    for k in ("aw_type", "aw_how", "aw_ip", "aw_ip_pick", "aw_url", "aw_tok", "aw_name", "aw_room", "aw_other", "aw_err",
               "aw_ha_url", "aw_ha_tok", "aw_ha_list", "aw_ha_msg", "aw_ha_ent", "aw_ha_man"):
         ss.pop(k, None)
 
@@ -5873,7 +5881,7 @@ def aw_create(cid, how, ip, url, tok, name, room, ha_ent=""):
 def found_ok(cid):
     """True when the device list chosen in the popup belongs to the current device type."""
     ss = st.session_state
-    want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",)}.get(cid, HA_DOMAINS)
+    want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",)}.get(cid, HA_DOMAINS)
     return any(e["entity_id"] == ss.get("aw_ha_ent") and e["domain"] in want for e in (ss.get("aw_ha_list") or []))
 
 
@@ -5907,9 +5915,14 @@ def add_wizard_body():
              format_func=lambda k: dict(opts)[k])
     how = ss.get("aw_how") if ss.get("aw_how") in dict(opts) else opts[0][0]
     if how == AW_WIZ:
-        st.text_input("Bulb address on your home Wi-Fi", key="aw_ip", placeholder="192.168.1.45", max_chars=45,
-                      help="Your router's list of connected devices shows it, named wiz_... In the WiZ app, "
-                           "also switch on Allow local communication for this bulb.")
+        found_ips = ss.get("wiz_found") or []
+        if found_ips:
+            st.selectbox("WiZ bulbs found on your Wi-Fi", found_ips + [""], key="aw_ip_pick",
+                         format_func=lambda v: v or "None of these, I will type the address")
+        if not (found_ips and ss.get("aw_ip_pick")):
+            st.text_input("Bulb address on your home Wi-Fi", key="aw_ip", placeholder="192.168.1.45", max_chars=45,
+                          help="Your router's list of connected devices shows it, named wiz_... In the WiZ app, "
+                               "also switch on Allow local communication for this bulb.")
     elif how == AW_HA:
         ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
         st.text_input("Home Assistant address", value=ha.get("url", ""), key="aw_ha_url",
@@ -5924,7 +5937,7 @@ def add_wizard_body():
                 ss["aw_ha_list"], ss["aw_ha_msg"] = [], "Enter the address (starting with https://) and the access token."
         if ss.get("aw_ha_msg"):
             st.warning(ss["aw_ha_msg"])
-        want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",)}.get(cid, HA_DOMAINS)
+        want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",)}.get(cid, HA_DOMAINS)
         found = [e for e in (ss.get("aw_ha_list") or []) if e["domain"] in want]
         if found:
             st.selectbox("Pick your device", [e["entity_id"] for e in found], key="aw_ha_ent",
@@ -5943,7 +5956,7 @@ def add_wizard_body():
     if ss.get("aw_err"):
         st.error(ss["aw_err"])
     if st.button("\u2795 Add device", key="aw_go", type="primary", width="stretch"):
-        nd, err = aw_create(cid, how, ss.get("aw_ip") or "", ss.get("aw_url") or "", ss.get("aw_tok") or "",
+        nd, err = aw_create(cid, how, ss.get("aw_ip_pick") or ss.get("aw_ip") or "", ss.get("aw_url") or "", ss.get("aw_tok") or "",
                             ss.get("aw_name") or "", ss.get("aw_room") or cur,
                             (ss.get("aw_ha_man") or "").strip() or (ss.get("aw_ha_ent") if how == AW_HA and found_ok(cid) else ""))
         if err:
@@ -5954,8 +5967,12 @@ def add_wizard_body():
         st.rerun()
 
 
-def open_add_wizard():
+def open_add_wizard(cid=None, how=None):
     aw_reset()
+    if cid:
+        st.session_state["aw_type"] = cid
+    if how:
+        st.session_state["aw_how"] = how
     title = "Add a device"
     if hasattr(st, "dialog"):
         st.dialog(title)(add_wizard_body)()
@@ -6185,6 +6202,93 @@ def render_room_settings():
             dk = "rs_dest_" + str(ss.get("room_rev", 0)) + "_" + room
             st.selectbox(t("rs_dest"), dests, key=dk, format_func=tr_room)
             st.button("🗑 " + t("rs_del"), key="rs_del_btn", on_click=delete_space, args=(dk,))
+
+
+# ----------------------------------------------------------------------------
+# Page 6 - Devices & Body Sensors: connect a heart-rate device, then add home devices (real connections only)
+# ----------------------------------------------------------------------------
+DEV_TYPES = (("bulb", "\U0001F4A1 Light bulb"), ("fan", "\U0001F300 Fan"), ("ac", "\u2744 Air conditioner"),
+             ("curtain", "\U0001FA9F Curtain"))
+DEV_BRANDS = {"bulb": ("WiZ", "Home Assistant"), "fan": ("Home Assistant",), "ac": ("Home Assistant",),
+              "curtain": ("Home Assistant",)}
+
+
+def cb_hr_open():
+    native_enqueue({"k": "hr_open"})
+
+
+def cb_hr_off():
+    native_enqueue({"k": "hr_off"})
+
+
+def cb_wiz_scan():
+    ss = st.session_state
+    ss["wiz_found"], ss["wiz_scanning"] = [], True
+    native_enqueue({"k": "wiz_scan"})
+
+
+def render_hr_device_section():
+    ss = st.session_state
+    st.subheader("\u2764\ufe0f Heart-rate device")
+    b = ss.get("ble") or {}
+    live = b.get("hr") and time.time() - b.get("ts", 0) < b.get("ttl", 25)
+    if live:
+        st.success("Connected: " + (b.get("name") or "heart-rate device") + "  \u2022  " + str(int(b["hr"])) + " BPM")
+    else:
+        st.caption("Not connected yet.")
+    tabs = st.tabs(["Band or smartwatch", "Apple Watch"])
+    with tabs[0]:
+        st.selectbox("Device", ["Bluetooth heart-rate band or strap", "Smartwatch or fit band (heart-rate broadcast switched on)"],
+                     key="hr_dev_kind")
+        st.caption("Wear it, switch on its heart-rate broadcast if it has that option, and close any other app that is "
+                   "connected to it. Then tap Connect and pick it from the list on your iPhone.")
+        c1, c2 = st.columns(2)
+        c1.button("Connect", key="hr_connect_btn", type="primary", on_click=cb_hr_open, width="stretch")
+        c2.button("Disconnect", key="hr_off_btn", on_click=cb_hr_off, width="stretch")
+        if not ss.get("native_seen"):
+            st.caption("Connecting a band works inside the AuraSync iPhone app.")
+    with tabs[1]:
+        st.markdown("An Apple Watch does not send heart rate to other apps by itself.")
+        st.caption("We are testing free relay apps that make the watch broadcast like a band, and we will build our own "
+                   "small watch app if none works well. Until then, if you already use a relay app in its direct mode, "
+                   "start it on the watch and tap the button below to look for it.")
+        st.button("Look for my Apple Watch", key="hr_aw_btn", on_click=cb_hr_open)
+
+
+def render_add_device_section():
+    ss = st.session_state
+    st.subheader("\U0001F3E0 Connect a home device")
+    labels = dict(DEV_TYPES)
+    cid = st.selectbox("Device", [k for k, _ in DEV_TYPES], key="dv_type", format_func=lambda k: labels[k])
+    brand = st.selectbox("Company", DEV_BRANDS[cid], key="dv_brand")
+    if brand == "WiZ":
+        st.caption("Your bulb must be on the same Wi-Fi as this iPhone, with Allow local communication switched on in the WiZ app.")
+        st.button("Find my WiZ bulbs", key="dv_wiz_scan", on_click=cb_wiz_scan)
+        if ss.get("wiz_scanning"):
+            st.info("Searching your Wi-Fi. This takes a few seconds.")
+        elif ss.get("wiz_found"):
+            st.success("Found " + str(len(ss["wiz_found"])) + " bulb(s): " + ", ".join(ss["wiz_found"]))
+        if not ss.get("native_seen"):
+            st.caption("Searching works inside the AuraSync iPhone app. You can also type the address yourself.")
+    else:
+        st.caption("Signs in to your Home Assistant once, then lists your devices so you can add them.")
+    if st.button("Connect", key="dv_connect", type="primary", width="stretch"):
+        open_add_wizard(cid, AW_WIZ if brand == "WiZ" else AW_HA)
+
+
+def page_devices():
+    st.header(t("p6"))
+    st.caption("Connect your heart-rate device, then your home devices. Everything else AuraSync does with them is automatic.")
+    render_hr_device_section()
+    st.divider()
+    render_add_device_section()
+    st.divider()
+    with st.expander("Rooms, Remote Access & Smart Geofence"):
+        render_room_settings()
+        st.divider()
+        render_connection()
+        st.divider()
+        render_microloc()
 
 
 def page_rooms():
@@ -7453,6 +7557,131 @@ def page_fleet():
         html_table(rows)
 
 
+# ---- Always-on service: the worker keeps the mode in step with the heart rate while AuraSync is closed ----------
+ALW_MODES = ("Sleep", "Energize", "Deep Meditation", "Focus", "Relax Evening", "Zen Garden")
+
+
+def alw_clean(a):
+    a = a if isinstance(a, dict) else {}
+    sc = a.get("scenes") if isinstance(a.get("scenes"), dict) else {}
+    return {"on": bool(a.get("on")), "key": str(a.get("key") or "")[:80],
+            "scenes": {m: str(e)[:80] for m, e in sc.items() if m in ALW_MODES and HA_ENT_RE.match(str(e))}}
+
+
+def alw_worker():
+    url, sec = _secret("AURASYNC_WORKER_URL"), _secret("AURASYNC_WORKER_SECRET")
+    return (str(url).rstrip("/"), str(sec)) if url and sec else (None, None)
+
+
+def alw_uid():
+    return hashlib.sha256(str(st.session_state.get("auth_email", "")).lower().encode()).hexdigest()[:32]
+
+
+def alw_sync():
+    """Send this user's settings to the worker. Returns an error text, or '' when it worked."""
+    ss = st.session_state
+    url, sec = alw_worker()
+    ha, a = ha_cfg(), alw_clean(ss.cfg.get("always"))
+    if not url:
+        return "The always-on service is not set up on this server yet."
+    if not ss.get("auth_email"):
+        return "Sign in first."
+    if not ha:
+        return "Link Home Assistant first."
+    cfg = ss.cfg
+    body = {"uid": alw_uid(), "ha_url": ha["url"], "ha_token": ha["token"], "enabled": a["on"], "scenes": a["scenes"],
+            "thr": int(cfg.get("thr", 85)), "rel": int(cfg.get("rel", 70)), "rest": int(cfg.get("rest", 62))}
+    try:
+        r = requests.put(url + "/v1/profile", json=body, headers={"X-Worker-Secret": sec}, timeout=10)
+        if r.status_code != 200:
+            return str(r.json().get("error", "error " + str(r.status_code)))[:160]
+        key = r.json().get("ingest_key")
+        if key:
+            a["key"] = key
+        ss.cfg["always"] = a
+        ss["_ingest_sent"] = False
+        return ""
+    except Exception as e:
+        return "Could not reach the always-on service (" + type(e).__name__ + ")."
+
+
+def alw_hook():
+    """Once per session, tell the iPhone app where to send heart-rate readings."""
+    ss = st.session_state
+    a = alw_clean(ss.cfg.get("always"))
+    url, _ = alw_worker()
+    if a["on"] and a["key"] and url and not ss.get("_ingest_sent"):
+        native_enqueue({"k": "ingest", "url": url + "/v1/reading", "key": a["key"]})
+        ss["_ingest_sent"] = True
+
+
+def cb_alw_save():
+    ss = st.session_state
+    a = alw_clean(ss.cfg.get("always"))
+    a["on"] = bool(ss.get("alw_on"))
+    a["scenes"] = {m: (ss.get("alw_sc_" + m) or "").strip() for m in ALW_MODES}
+    a = alw_clean(a)
+    ss.cfg["always"] = a
+    err = alw_sync()
+    ss["alw_msg"] = ("bad", err) if err else ("ok", "Saved. Your home now follows your heart rate even when AuraSync is closed, as long as your phone or watch keeps sending it.")
+
+
+def cb_alw_find():
+    found, msg = ha_discover(("scene", "script"))
+    ss = st.session_state
+    ss["alw_found"] = [e["entity_id"] for e in found]
+    ss["alw_msg"] = ("bad", msg) if msg else ("ok", "Found " + str(len(found)) + " scenes and scripts in Home Assistant.")
+
+
+def cb_alw_status():
+    url, _ = alw_worker()
+    a = alw_clean(st.session_state.cfg.get("always"))
+    try:
+        r = requests.get(url + "/v1/status", headers={"Authorization": "Bearer " + a["key"]}, timeout=8)
+        d = r.json()
+        if r.status_code != 200:
+            st.session_state["alw_msg"] = ("bad", "The service does not know this account yet. Tap Save.")
+        else:
+            seen = time.strftime("%H:%M:%S", time.localtime(d["last_seen"])) if d.get("last_seen") else "never"
+            st.session_state["alw_msg"] = ("ok", "Last reading " + seen + (" (" + str(d.get("last_hr")) + " bpm)" if d.get("last_hr") else "") +
+                                           ". Last mode sent: " + str(d.get("last_mode") or "none yet") +
+                                           (". Problem: " + d["last_error"] if d.get("last_error") else "."))
+    except Exception as e:
+        st.session_state["alw_msg"] = ("bad", "Could not reach the always-on service (" + type(e).__name__ + ").")
+
+
+def render_always_card():
+    ss = st.session_state
+    st.markdown("**\U0001F319 Always-on mode (works when AuraSync is closed)**")
+    url, _ = alw_worker()
+    if not url:
+        st.caption("This needs the AuraSync always-on service. It is not set up on this server yet.")
+        return
+    if not ha_cfg():
+        st.caption("Link Home Assistant first (Add a device, then Home Assistant). It must be reachable from the internet.")
+        return
+    a = alw_clean(ss.cfg.get("always"))
+    st.caption("Pick the Home Assistant scene or script for each mode. When your heart rate changes the mode, the service "
+               "activates that scene. Modes without a scene are left alone.")
+    st.toggle("Keep my home on auto-pilot", value=a["on"], key="alw_on")
+    found = ss.get("alw_found") or []
+    for m in ALW_MODES:
+        cur = a["scenes"].get(m, "")
+        if found:
+            opts = [""] + found + ([cur] if cur and cur not in found else [])
+            st.selectbox(m, opts, index=opts.index(cur) if cur in opts else 0, key="alw_sc_" + m,
+                         format_func=lambda v: v or "(do nothing)")
+        else:
+            st.text_input(m, value=cur, key="alw_sc_" + m, placeholder="scene.relax_evening", max_chars=80)
+    c1, c2, c3 = st.columns(3)
+    c1.button("Find my scenes", key="alw_find", on_click=cb_alw_find)
+    c2.button("Save", key="alw_save", type="primary", on_click=cb_alw_save)
+    c3.button("Check status", key="alw_status", on_click=cb_alw_status, disabled=not a["key"])
+    res = ss.get("alw_msg")
+    if res:
+        (st.success if res[0] == "ok" else st.warning)(res[1])
+
+
 def cb_ha_unlink():
     ss = st.session_state
     ss.cfg.pop("ha", None)                       # the saved address and token leave the account record on the next save
@@ -7491,9 +7720,9 @@ def page_system():
     st.header(t("p5"))
     cfg["api_url"] = st.text_input(t("api"), value=cfg["api_url"])
     cfg["api_token"] = st.text_input(t("api_token"), value=cfg.get("api_token", ""), type="password", key="api_token_w")
-    render_wearables_hub()
     render_wearable()
     render_ha_link_card()
+    render_always_card()
     c1, c2, c3, c4 = st.columns(4)
     cfg["thr"] = c1.slider(t("thr"), 85, 150, int(cfg["thr"]))
     cfg["rel"] = c2.slider(t("rel"), 55, 95, int(cfg["rel"]))
@@ -9477,7 +9706,7 @@ def render_main_dashboard():
         ss.flash = ""
     run_routines()
     render_geo_banner(show_card=(ss.nav != 6))
-    pages = {1: page_dashboard, 2: page_moods, 3: page_inner_voice, 4: page_fleet, 5: page_system, 6: page_rooms}
+    pages = {1: page_dashboard, 2: page_moods, 3: page_inner_voice, 4: page_fleet, 5: page_system, 6: page_devices}
     pages[ss.nav]()
     try:
         render_aura_fab()
@@ -9998,6 +10227,7 @@ def sync_user_record():
     email = ss.get("auth_email")
     if not email:
         return
+    alw_hook()
     prof, lang = ss.get("profile"), ss.get("lang", "English")
     ss.gate_lang = lang
     pj = profile_to_json(prof) if prof else None
