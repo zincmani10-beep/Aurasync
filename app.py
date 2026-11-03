@@ -859,6 +859,9 @@ def t(key, **kw):
 
 
 def tr_room(name):
+    alias = (st.session_state.get("room_alias") or {}).get(name)
+    if alias:
+        return alias
     lang = st.session_state.get("lang", "English")
     return ROOM_NAMES.get(name, {}).get(lang, name)
 
@@ -2742,7 +2745,7 @@ def home_to_json():
     ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
     return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", "")),
             "ha": {"url": str(ha.get("url", "")), "token": str(ha.get("token", ""))},
-            "always": alw_clean(ss.cfg.get("always"))}
+            "always": alw_clean(ss.cfg.get("always")), "aliases": dict(ss.get("room_alias") or {})}
 
 
 def home_restore():
@@ -2753,7 +2756,7 @@ def home_restore():
         return False
     try:
         raw_devs, raw_sp = h.get("devices"), h.get("spaces")
-        if not isinstance(raw_devs, list) or not isinstance(raw_sp, dict) or not raw_devs:
+        if not isinstance(raw_devs, list) or not isinstance(raw_sp, dict):
             return False
         if not all(isinstance(raw_sp.get(n), dict) for n in PROTECTED_SPACES):
             return False
@@ -2765,6 +2768,8 @@ def home_restore():
             cid, uid = r.get("cid"), r.get("uid")
             if cid not in CAT or not isinstance(uid, int) or isinstance(uid, bool) or uid in seen:
                 continue
+            if r.get("proto") not in HOME_PROTOS or r.get("proto") == "Simulation":
+                continue                                    # old demo devices are cleaned out here
             seen.add(uid)
             d = new_device(cid, str(r.get("name") or CAT[cid][2])[:40], str(r.get("room") or "")[:40])
             d["uid"] = uid
@@ -2778,8 +2783,6 @@ def home_restore():
             if d["proto"] != "Simulation":
                 d["last"] = "restored from your account"
             fleet.append(d)
-        if not fleet:
-            return False
         spaces = {}
         for n, sp in raw_sp.items():
             if not isinstance(n, str) or not isinstance(sp, dict):
@@ -2802,6 +2805,8 @@ def home_restore():
                               "persona": sp.get("persona") if sp.get("persona") in ("personal", "shared") else None}
         ss.fleet, ss.spaces = fleet, spaces
         ss.uid = max([ss.uid] + list(seen))
+        al = h.get("aliases") if isinstance(h.get("aliases"), dict) else {}
+        ss["room_alias"] = {k: str(v)[:40] for k, v in al.items() if k in spaces and str(v).strip()}
         ip = str(h.get("wiz_ip") or "").strip()
         if ip and wiz_ip_ok(ip):
             ss.cfg["wiz_ip"] = ip
@@ -2838,25 +2843,10 @@ def init_state():
         if home_restore():                       # this user's saved devices and rooms: nothing is sent to the real devices here
             ss.active_mode = "Relax Evening"
         else:
-            ss.fleet = []
-            ss.spaces = {}
-            for room, (icon, typ, devs) in DEFAULT_SPACES.items():
-                ids = []
-                for cid, label in devs:
-                    d = new_device(cid, label + " · " + room, room)
-                    ss.fleet.append(d)
-                    ids.append(d["uid"])
-                ss.spaces[room] = {"icon": icon, "type": typ, "devices": ids, "preset": None}
+            ss.fleet = []                                   # no demo devices: the user adds real ones
+            ss.spaces = {room: {"icon": icon, "type": typ, "devices": [], "preset": None}
+                         for room, (icon, typ, _demo) in DEFAULT_SPACES.items()}
             ss.active_mode = "Relax Evening"
-            apply_mode(ss.active_mode)
-            # Pre-fill every predefined room's one-click default
-            keep = {d["uid"]: (d["on"], d["lvl"], d["color"]) for d in ss.fleet}
-            apply_mode(ss.active_mode, why=False, devs=list(ss.fleet), set_active=False)
-            for room in ss.spaces:
-                snapshot_room(room)
-            for d in ss.fleet:
-                d["on"], d["lvl"], d["color"] = keep[d["uid"]]
-            ss.log = []
     for k, v in (("hr_hist", [72 + random.randint(-3, 3) for _ in range(30)]), ("skin_hist", []),
                  ("bstate", "relaxed"), ("last_state", None), ("wake_ticks", 0), ("sleep_ts", 0.0), ("prev_auto", False),
                  ("flash", ""), ("profile", None), ("editing", False), ("chat", []), ("chimed", False),
@@ -5846,7 +5836,8 @@ def open_matter():
 # ----------------------------------------------------------------------------
 # Add a device: one short popup (what is it -> how does it connect -> name + room)
 # ----------------------------------------------------------------------------
-AW_TYPES = (("bulb", "\U0001F4A1", "Light"), ("fan", "\U0001F300", "Fan"), ("ac", "\u2744", "AC"))
+AW_TYPES = (("bulb", "\U0001F4A1", "Light"), ("fan", "\U0001F300", "Fan"), ("ac", "\u2744", "AC"),
+            ("curtain", "\U0001FA9F", "Curtain"), ("geyser", "\u2668", "Geyser"))
 AW_WIZ, AW_HUB, AW_DEMO, AW_HA = "wiz", "hub", "demo", "ha"
 
 
@@ -5862,7 +5853,7 @@ def aw_create(cid, how, ip, url, tok, name, room, ha_ent=""):
     ss = st.session_state
     if cid not in CAT or room not in ss.spaces:
         return None, "Pick a device type and a room."
-    proto, addr, token = "Simulation", "", ""
+    proto, addr, token = "", "", ""
     if how == AW_WIZ:
         ip = ip.strip()
         if not wiz_ip_ok(ip):
@@ -5880,52 +5871,44 @@ def aw_create(cid, how, ip, url, tok, name, room, ha_ent=""):
         if not (url.startswith("http://") or url.startswith("https://")):
             return None, "The webhook address must start with http:// or https://"
         proto, addr, token = "Home Assistant / REST", url[:300], tok.strip()[:300]
+    if not proto:
+        return None, "Pick how the device connects."
     nd = new_device(cid, unique_name((name or "").strip()[:40] or CAT[cid][2]), room)
     nd["proto"], nd["addr"], nd["token"] = proto, addr, token
     nd["status"] = "connected"
-    nd["last"] = "added just now" if proto != "Simulation" else "demo device ready"
+    nd["last"] = "added just now"
     ss.fleet.append(nd)
     ss.spaces[room]["devices"].append(nd["uid"])
     ss.room_rev = ss.get("room_rev", 0) + 1
     log("\u2795 " + nd["name"] + " added to " + room)
-    if proto != "Simulation":
-        push(nd)                                   # lets the iPhone app / server reach it right away
+    push(nd)                                       # lets the iPhone app / server reach it right away
     return nd, ""
 
 
 def found_ok(cid):
     """True when the device list chosen in the popup belongs to the current device type."""
     ss = st.session_state
-    want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",)}.get(cid, HA_DOMAINS)
+    want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",),
+            "geyser": ("switch", "water_heater")}.get(cid, HA_DOMAINS)
     return any(e["entity_id"] == ss.get("aw_ha_ent") and e["domain"] in want for e in (ss.get("aw_ha_list") or []))
 
 
 def add_wizard_body():
     ss = st.session_state
     st.markdown("**1. What are you adding?**")
-    cols = st.columns(4)
-    for col, (cid, icon, label) in zip(cols, AW_TYPES):
-        if col.button(icon + " " + label, key="aw_t_" + cid, width="stretch",
-                      type="primary" if ss.get("aw_type") == cid else "secondary"):
-            ss["aw_type"] = cid
-    if cols[3].button("\u2795 Other", key="aw_t_other", width="stretch",
-                      type="primary" if ss.get("aw_type") == "other" else "secondary"):
-        ss["aw_type"] = "other"
-    typ = ss.get("aw_type")
-    if typ == "other":
-        others = [k for k in CAT if k not in ("bulb", "fan", "ac")]
-        st.selectbox("Device type", others, key="aw_other", format_func=lambda k: CAT[k][1] + " " + CAT[k][2])
-        cid = ss.get("aw_other") if ss.get("aw_other") in CAT else others[0]
-    else:
-        cid = typ
+    cols = st.columns(len(AW_TYPES))
+    for col, (tid, icon, label) in zip(cols, AW_TYPES):
+        if col.button(icon + " " + label, key="aw_t_" + tid, width="stretch",
+                      type="primary" if ss.get("aw_type") == tid else "secondary"):
+            ss["aw_type"] = tid
+    cid = ss.get("aw_type")
     if cid not in CAT:
         st.caption("Tap the kind of device you want to add.")
         return
 
     st.markdown("**2. How does it connect?**")
     opts = ([(AW_WIZ, "Philips WiZ bulb")] if cid == "bulb" else []) + [
-        (AW_HA, "Home Assistant (finds my devices)"), (AW_HUB, "Other hub or webhook"),
-        (AW_DEMO, "Just try it first (demo device)")]
+        (AW_HA, "Home Assistant (finds my devices)"), (AW_HUB, "Other hub or webhook")]
     st.radio("How does it connect?", [o[0] for o in opts], key="aw_how", label_visibility="collapsed",
              format_func=lambda k: dict(opts)[k])
     how = ss.get("aw_how") if ss.get("aw_how") in dict(opts) else opts[0][0]
@@ -5952,7 +5935,8 @@ def add_wizard_body():
                 ss["aw_ha_list"], ss["aw_ha_msg"] = [], "Enter the address (starting with https://) and the access token."
         if ss.get("aw_ha_msg"):
             st.warning(ss["aw_ha_msg"])
-        want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",)}.get(cid, HA_DOMAINS)
+        want = {"bulb": ("light",), "fan": ("fan",), "ac": ("climate",), "curtain": ("cover",),
+            "geyser": ("switch", "water_heater")}.get(cid, HA_DOMAINS)
         found = [e for e in (ss.get("aw_ha_list") or []) if e["domain"] in want]
         if found:
             st.selectbox("Pick your device", [e["entity_id"] for e in found], key="aw_ha_ent",
@@ -6175,14 +6159,6 @@ def render_room_settings():
                 st.button("🗑 " + t("rs_dev_remove"), key="rs_rm_" + str(d["uid"]), on_click=remove_device,
                           args=(d["uid"],))
 
-    with st.expander(t("rs_add_dev")):
-        with st.form("add_dev_form", clear_on_submit=True):
-            f1, f2 = st.columns([3, 2])
-            f1.selectbox(t("dev_pick"), list(CAT.keys()), key="ad_cid",
-                         format_func=lambda k: CAT[k][1] + " " + CAT[k][2] + "  ·  " + CAT[k][3])
-            f2.text_input(t("dev_name"), key="ad_name", max_chars=40)
-            st.form_submit_button(t("dev_btn"), on_click=add_device_here)
-
     with st.expander(t("qc")):
         cols = st.columns(3)
         for i, d in enumerate(devs):
@@ -6223,9 +6199,9 @@ def render_room_settings():
 # Page 6 - Devices & Body Sensors: connect a heart-rate device, then add home devices (real connections only)
 # ----------------------------------------------------------------------------
 DEV_TYPES = (("bulb", "\U0001F4A1 Light bulb"), ("fan", "\U0001F300 Fan"), ("ac", "\u2744 Air conditioner"),
-             ("curtain", "\U0001FA9F Curtain"))
+             ("curtain", "\U0001FA9F Curtain"), ("geyser", "\u2668 Water heater (geyser)"))
 DEV_BRANDS = {"bulb": ("WiZ", "Home Assistant"), "fan": ("Home Assistant",), "ac": ("Home Assistant",),
-              "curtain": ("Home Assistant",)}
+              "curtain": ("Home Assistant",), "geyser": ("Home Assistant",)}
 
 
 def cb_hr_open():
@@ -7502,89 +7478,98 @@ def add_fleet_device():
     log("➕ " + nd["name"] + " added to " + room)
 
 
+def cb_room_alias(room, key):
+    ss = st.session_state
+    v = (ss.get(key) or "").strip()[:40]
+    al = dict(ss.get("room_alias") or {})
+    if v and v != room:
+        al[room] = v
+    else:
+        al.pop(room, None)
+    ss["room_alias"] = al
+
+
+def cb_fl_add_room():
+    ss = st.session_state
+    name = (ss.get("fl_new_room") or "").strip()[:40]
+    if not name:
+        ss.flash = "Type a name for the new room."
+        return
+    if name in ss.spaces or name in (ss.get("room_alias") or {}).values():
+        ss.flash = "You already have a room with that name."
+        return
+    ss.spaces[name] = {"icon": "\U0001F3E0", "type": "Other", "devices": [], "preset": None, "persona": None}
+    ss.room_rev = ss.get("room_rev", 0) + 1
+    ss.flash = "Room added: " + name
+
+
+def cb_fl_delete_room(room):
+    ss = st.session_state
+    if room in PROTECTED_SPACES or ss.spaces.get(room, {}).get("devices") or any(d["room"] == room for d in ss.fleet):
+        ss.flash = "Move or remove the devices in this room first."
+        return
+    ss.spaces.pop(room, None)
+    ss.room_mode.pop(room, None)
+    (ss.get("room_alias") or {}).pop(room, None)
+    repair_orphans()
+    ss.room_rev = ss.get("room_rev", 0) + 1
+
+
+def render_fleet_device(dv):
+    ss = st.session_state
+    uid = dv["uid"]
+    badge = {"connected": "\U0001F7E2 Connected", "offline": "\U0001F534 Not reachable", "not connected": "\u26AA Not connected"}
+    with st.container(border=True):
+        st.markdown("**" + CAT[dv["cid"]][1] + " " + html.escape(dv["name"]) + "**  \n" + badge.get(dv["status"], dv["status"]) +
+                    ((" \u00B7 " + html.escape(str(dv["last"]))) if dv.get("last") else ""))
+        device_editor(dv, "fl")
+        with st.expander("More"):
+            rooms = list(ss.spaces)
+            rk = "fl_room_" + str(uid) + "_" + str(ss.get("room_rev", 0))
+            st.selectbox("Room", rooms, index=rooms.index(dv["room"]) if dv["room"] in rooms else 0, key=rk,
+                         on_change=cb_dev_room, args=(uid, rk), format_func=tr_room)
+            if dv["proto"] == "Home Assistant API":
+                st.caption("\U0001F3E0 Home Assistant \u00B7 " + str(dv["addr"]))
+            elif dv["proto"].startswith("Philips"):
+                st.caption("\U0001F4A1 WiZ \u00B7 " + str(dv["addr"]))
+            c1, c2 = st.columns(2)
+            c1.button("Check connection", key="cn_" + str(uid), on_click=connect_device, args=(dv,))
+            c2.button("\U0001F5D1 Remove", key="rm_" + str(uid), on_click=remove_device, args=(uid,))
+
+
 def page_fleet():
     ss = st.session_state
-    pro = ss.ui_mode == "pro"
     st.header(t("p4"))
-    st.subheader("🔗 " + t("conn_hub"))
-    total = len(ss.fleet)
-    ok = sum(1 for d in ss.fleet if d["status"] == "connected")
-    h1, h2, h3 = st.columns(3)
-    h1.markdown(stat(t("dev_my"), total), unsafe_allow_html=True)
-    h2.markdown(stat(t("s_ok"), str(ok) + " / " + str(total)), unsafe_allow_html=True)
-    h3.markdown(stat(t("ai_auto"), t("mode_auto").split(" (")[0] if ss.cfg["auto_mode"] else t("mode_manual")),
-                unsafe_allow_html=True)
-    st.caption(t("dev_hint"))
     if st.button("\u2795 Add a device", key="fl_aw_open", type="primary"):
         open_add_wizard()
-    if st.button(t("matter_btn"), key="mt_open"):
-        open_matter()
-    if pro:
-        b1, b2 = st.columns(2)
-        if b1.button(t("conn_all"), key="fl_conn_all"):
-            connect_all()
-        if b2.button(t("sync"), key="fl_sync"):
-            apply_mode(ss.active_mode, devs=list(ss.fleet))
-            ss.flash = t("synced") + " (" + tr_mode(ss.active_mode) + ")"
-            st.rerun()
-        with st.expander("➕ " + t("dev_add")):
-            with st.form("add_device", clear_on_submit=True):
-                a1, a2, a3 = st.columns([3, 2, 2])
-                a1.selectbox(t("dev_pick"), list(CAT.keys()), key="fl_add_cid",
-                             format_func=lambda k: CAT[k][1] + " " + CAT[k][2] + "  ·  " + CAT[k][3])
-                a2.selectbox(t("dev_room"), list(ss.spaces), key="fl_add_room", format_func=tr_room)
-                a3.text_input(t("dev_name"), key="fl_add_name", max_chars=40)
-                st.form_submit_button(t("dev_btn"), on_click=add_fleet_device)
-
-    st.subheader("🔌 " + t("dev_my") + " (" + str(len(ss.fleet)) + ")")
-    badge = {"connected": "🟢 " + t("s_ok"), "offline": "🔴 " + t("s_off"), "not connected": "⚪ " + t("s_no")}
-    cols = st.columns(2 if pro else 3)
-    for i, dv in enumerate(ss.fleet):
-        c = CAT[dv["cid"]]
-        uid = dv["uid"]
-        with cols[i % len(cols)]:
-            with st.container(border=True):
-                st.markdown("**" + c[1] + " " + html.escape(dv["name"]) + "**  \n" + html.escape(tr_room(dv["room"])) + " · " +
-                            badge.get(dv["status"], dv["status"]))
-                if not pro:
-                    k = "fl_zpw_" + str(uid) + "_" + str(dv.get("rev", 0))
-                    st.toggle(t("power_lbl"), value=bool(dv["on"]), key=k, on_change=cb_power, args=(uid, k))
-                    continue
-                device_editor(dv, "fl")
-                with st.expander(t("adv_conn")):
-                    rooms = list(ss.spaces)
-                    rk = "fl_room_" + str(uid) + "_" + str(ss.get("room_rev", 0))
-                    st.selectbox(t("dev_room"), rooms, index=rooms.index(dv["room"]) if dv["room"] in rooms else 0,
-                                 key=rk, on_change=cb_dev_room, args=(uid, rk), format_func=tr_room)
-                    if "Matter" in dv["proto"]:
-                        st.caption("🟢 Matter · " + t("s_ok"))
-                    elif dv["proto"] == "Home Assistant API":
-                        st.caption("🏠 Home Assistant · " + str(dv["addr"]))
-                    else:
-                        protos = PROTOS_BULB if dv["cid"] == "bulb" else PROTOS
-                        pk = "fl_proto_" + str(uid)
-                        st.selectbox(t("proto"), protos, index=protos.index(dv["proto"]) if dv["proto"] in protos else 0,
-                                     key=pk, on_change=cb_proto, args=(uid, pk))
-                        if dv["proto"] != "Simulation":
-                            ak, tk = "fl_addr_" + str(uid), "fl_tok_" + str(uid)
-                            st.text_input(t("addr"), value=dv["addr"], key=ak, on_change=cb_dev_field,
-                                          args=(uid, ak, "addr"))
-                            st.text_input("Token", value=dv["token"], key=tk, type="password", on_change=cb_dev_field,
-                                          args=(uid, tk, "token"))
-                        st.button(t("conn_btn"), key="cn_" + str(uid), on_click=connect_device, args=(dv,))
-                if dv["last"]:
-                    st.caption(dv["last"])
-                st.button("🗑", key="rm_" + str(uid), on_click=remove_device, args=(uid,))
-
-    if pro:
-        st.subheader("📜 " + t("ai_log"))
-        for e in ss.log[:12]:
-            st.markdown('<div class="logl">' + e["t"] + "  " + html.escape(e["x"]) + "</div>", unsafe_allow_html=True)
-        rows = [{"Device": CAT[d["cid"]][1] + " " + d["name"], "Room": tr_room(d["room"]), "Status": "ON" if d["on"] else "OFF",
-                 "Level": (str(d["lvl"]) + UNIT.get(d["cid"], "%")) if CAT[d["cid"]][4] else "-",
-                 "Link": d["proto"] + " / " + d["status"]} for d in ss.fleet]
-        st.subheader("📋 " + t("summary"))
-        html_table(rows)
+    if not ss.fleet:
+        with st.container(border=True):
+            st.markdown("**Add your first device**")
+            st.caption("Tap Add a device, pick what it is (light, fan, AC, curtain or geyser), then how it connects. "
+                       "It will appear here under its room, and you can control it by hand or let AuraSync do it for you.")
+    for room, sp in ss.spaces.items():
+        ds = [d for d in ss.fleet if d["room"] == room]
+        if not ds:
+            continue
+        st.subheader(sp["icon"] + " " + tr_room(room) + "  (" + str(len(ds)) + ")")
+        for dv in ds:
+            render_fleet_device(dv)
+    with st.expander("Rooms"):
+        st.caption("Rename a room or add a new one. Device cards above are grouped by room.")
+        for room in list(ss.spaces):
+            rk = "fl_alias_" + room
+            r1, r2 = st.columns([4, 1])
+            r1.text_input(room, value=tr_room(room) if (ss.get("room_alias") or {}).get(room) else room, key=rk,
+                          max_chars=40, on_change=cb_room_alias, args=(room, rk), label_visibility="collapsed")
+            if room not in PROTECTED_SPACES:
+                r2.button("\U0001F5D1", key="fl_delroom_" + room, on_click=cb_fl_delete_room, args=(room,))
+        a1, a2 = st.columns([4, 1])
+        a1.text_input("New room", key="fl_new_room", placeholder="New room name", max_chars=40, label_visibility="collapsed")
+        a2.button("\u2795", key="fl_add_room_btn", on_click=cb_fl_add_room)
+    if ss.ui_mode == "pro":
+        with st.expander("\U0001F4DC " + t("ai_log")):
+            for e in ss.log[:12]:
+                st.markdown('<div class="logl">' + e["t"] + "  " + html.escape(e["x"]) + "</div>", unsafe_allow_html=True)
 
 
 # ---- Always-on service: the worker keeps the mode in step with the heart rate while AuraSync is closed ----------
@@ -8988,12 +8973,16 @@ def ai_clause(c, room_ctx, last_act):
         where = "All rooms" if allw else tr_room(room)
         for label, icon, _words, cids in groups:
             devs = [d for d in base if d["cid"] in cids]
+            wh = where
+            if not devs and not allw and not explicit:     # nothing of that kind in this room: use the ones in other rooms
+                devs = [d for d in ss.fleet if d["cid"] in cids]
+                wh = "All rooms"
             color = None
             if label == "lights":
                 cm = re.search(r"\b(warm|white|red|blue|green|purple|violet|pink|orange|yellow|cool)\b", c)
                 color = AI_COLORS.get(cm.group(1)) if cm else None
             if not devs:
-                out.append("⚠ No " + label + " in " + where)
+                out.append("⚠ No " + label + " added yet. Tap Add a device first.")
                 continue
             if act is None and not color:
                 continue
@@ -9010,7 +8999,7 @@ def ai_clause(c, room_ctx, last_act):
                 state = str(first["lvl"]) + UNIT.get(first["cid"], "%")
             else:
                 state = "on" if first["on"] else "off"
-            out.append(icon + " " + where + " " + label + " " + state + ((" · " + cname) if cname and act != "off" else ""))
+            out.append(icon + " " + wh + " " + label + " " + state + ((" · " + cname) if cname and act != "off" else ""))
         return out, room, (act, n)
     # 2b) "turn off everything"
     if act == "off" and re.search(r"\b(?:everything|all devices|all the devices|whole house|entire house)\b", c):
