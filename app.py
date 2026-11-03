@@ -1732,7 +1732,8 @@ def stat(label, value, extra=""):
 # ----------------------------------------------------------------------------
 GENRES = ["Pop", "Rock", "Blues", "Hip-Hop", "Jazz", "Classical", "Metal", "Folk", "EDM", "Country",
           "Disco", "OM Mantra", "Chinese Zen", "Lo-Fi Chill", "Ambient Space", "Calm 432Hz"]
-INSTRUMENTS = ["Piano", "Flute", "Rain", "Tabla", "Veena", "Singing Bowls", "Strings", "Ocean Waves", "Sitar", "Harp"]
+INSTRUMENTS = ["Piano", "Flute", "Rain", "Tabla", "Veena", "Singing Bowls", "Strings", "Ocean Waves", "Sitar", "Harp",
+               "Violin", "Guitar", "Santoor", "Bansuri"]
 SCENES = {"Warm Glow": "#FFB347", "Candlelight": "#FF8C42", "Aurora": "#5FFBB1", "Sunset": "#FF6B6B",
           "Ocean": "#3FA7D6", "Cool Focus": "#EAF4FF"}
 AC_MODES = ["Cool", "Dry", "Fan Only", "Sleep Eco"]
@@ -1940,15 +1941,44 @@ def any_mix(m):
     return isinstance(m, dict) and any(full_mix(m).values())
 
 
-def wiz_send(addr, payload):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)
-    try:
-        s.sendto(json.dumps(payload).encode("utf-8"), (addr, 38899))
-        data, _ = s.recvfrom(2048)
-        return json.loads(data.decode("utf-8"))
-    finally:
-        s.close()
+def wiz_send(addr, payload, tries=3, wait=1.5):
+    """WiZ bulbs talk UDP, which drops packets now and then. Try a few times before giving up."""
+    last = None
+    for _ in range(max(1, tries)):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(wait)
+        try:
+            s.sendto(json.dumps(payload).encode("utf-8"), (addr, 38899))
+            data, _ = s.recvfrom(2048)
+            return json.loads(data.decode("utf-8"))
+        except (socket.timeout, OSError, ValueError) as e:
+            last = e
+        finally:
+            s.close()
+    raise last if last else OSError("no answer")
+
+
+def wiz_color_params(hex_color):
+    """WiZ colour payload. Warm / neutral / cool whites are sent as a real colour temperature (Kelvin)
+    because an RGB-only 'orange' looks yellow-green on a WiZ bulb; every other colour stays RGB."""
+    r, g, b = hex_rgb(hex_color)
+    mx, mn = max(r, g, b), min(r, g, b)
+    sat = 0.0 if mx == 0 else (mx - mn) / float(mx)
+    if mx == mn:
+        hue = 0.0
+    elif mx == r:
+        hue = (60 * ((g - b) / float(mx - mn))) % 360
+    elif mx == g:
+        hue = 60 * (2 + (b - r) / float(mx - mn))
+    else:
+        hue = 60 * (4 + (r - g) / float(mx - mn))
+    if sat < 0.25:                                           # whites: from warm-ish to cool daylight
+        k = 4200 + ((b - r) / 255.0) * 9500
+        return {"temp": int(max(2700, min(6500, round(k, -2))))}
+    if 15 <= hue <= 45 and sat <= 0.80:                      # amber / candle / warm white
+        k = 3400 - (sat - 0.25) * 1700
+        return {"temp": int(max(2200, min(3400, round(k, -2))))}
+    return {"r": r, "g": g, "b": b}
 
 
 def push(dev):
@@ -1966,9 +1996,10 @@ def push(dev):
         return
     try:
         if dev["proto"].startswith("Philips"):
-            r, g, b = hex_rgb(dev["color"])
-            params = {"state": bool(dev["on"]), "dimming": max(10, int(dev["lvl"])), "r": r, "g": g, "b": b}
+            params = {"state": bool(dev["on"]), "dimming": max(10, int(dev["lvl"]))}
+            params.update(wiz_color_params(dev["color"]))
             wiz_send(dev["addr"], {"id": 1, "method": "setPilot", "params": params})
+            dev["fails"], dev["retry_at"] = 0, 0
         else:
             body = {"source": "AuraSync", "device": dev["name"], "type": dev["cid"], "room": dev["room"],
                     "state": "on" if dev["on"] else "off", "level": dev["lvl"], "color": dev["color"],
@@ -1978,7 +2009,8 @@ def push(dev):
         dev["last"] = "sent " + datetime.now().strftime("%H:%M:%S") + (" via cloud relay" if st.session_state.conn["mode"] == "away" else " via local mesh")
     except Exception as e:
         dev["status"] = "offline"
-        dev["last"] = type(e).__name__
+        dev["last"] = type(e).__name__ + " - will reconnect automatically"
+        dev["retry_at"] = time.time() + 8
 
 
 def connect_device(dev):
@@ -2000,7 +2032,7 @@ def connect_device(dev):
         if dev["proto"] == "Simulation":
             dev["status"], dev["last"] = "connected", "simulated device ready"
         elif dev["proto"].startswith("Philips"):
-            res = wiz_send(dev["addr"], {"id": 1, "method": "getPilot", "params": {}})
+            res = wiz_send(dev["addr"], {"id": 1, "method": "getPilot", "params": {}}, tries=2, wait=1.2)
             ok = bool(res)
             dev["status"], dev["last"] = ("connected" if ok else "offline"), ("WiZ answered" if ok else "no answer")
         else:
@@ -2011,6 +2043,35 @@ def connect_device(dev):
     except Exception as e:
         dev["status"], dev["last"] = "offline", type(e).__name__
     return dev["status"] == "connected"
+
+
+def auto_reconnect(max_devices=2):
+    """Quietly bring 'Not reachable' real devices back. Runs on every live refresh, backs off after repeated misses,
+    and re-sends the device's current state the moment it answers again."""
+    ss = st.session_state
+    if native_on():
+        return
+    now = time.time()
+    tried = 0
+    for d in list(ss.fleet):
+        if tried >= max_devices:
+            break
+        if d["proto"] == "Simulation" or d["proto"] == "Home Assistant API" or not d.get("addr"):
+            continue
+        if d.get("status") not in ("offline", "not connected"):
+            continue
+        if d.get("retry_at", 0) > now:
+            continue
+        tried += 1
+        if connect_device(d):
+            d["fails"], d["retry_at"] = 0, 0
+            d["last"] = "reconnected " + datetime.now().strftime("%H:%M:%S")
+            push(d)                                          # put it back to the state the app expects
+            log("\U0001F501 " + d["name"] + " reconnected automatically")
+        else:
+            d["fails"] = d.get("fails", 0) + 1
+            d["retry_at"] = now + min(120, 8 * (2 ** min(d["fails"], 4)))
+            d["last"] = "not reachable - retrying automatically"
 
 
 def set_dev(dev, on=None, lvl=None, color=None, why=""):
@@ -2117,8 +2178,9 @@ def eta_min(km):
     return int(round(km * 3))
 
 
-def apply_mode(name, why=True, devs=None, set_active=True):
-    """Sync bulbs, AC, fan, curtains and ambient devices to a mode."""
+def apply_mode(name, why=True, devs=None, set_active=True, force=False):
+    """Sync bulbs, AC, fan, curtains and ambient devices to a mode.
+    force=True is used when the person picks the mode: it clears old 15-minute manual holds first."""
     ss = st.session_state
     env = ss.modes[name]
     if set_active:
@@ -2126,6 +2188,9 @@ def apply_mode(name, why=True, devs=None, set_active=True):
         ss.cfg["mix"] = full_mix(env["mix"]) if any_mix(env.get("mix")) else full_mix(ss.cfg.get("mix"))
     pool = scope_devs() if devs is None else devs
     extras = env.get("extras", [])
+    if force:
+        for d in pool:
+            st.session_state.holds.pop(d["uid"], None)
     for d in pool:
         if held(d):
             continue
@@ -3507,8 +3572,9 @@ def wiz_fire(ip, hex_color, dim):
     """Fire-and-forget WiZ setPilot UDP packet to a bulb on the local network."""
     if not wiz_ip_ok(ip):
         return False
-    r, g, b = hex_rgb(hex_color)
-    payload = {"id": 1, "method": "setPilot", "params": {"state": True, "dimming": max(10, min(100, int(dim))), "r": r, "g": g, "b": b}}
+    params = {"state": True, "dimming": max(10, min(100, int(dim)))}
+    params.update(wiz_color_params(hex_color))
+    payload = {"id": 1, "method": "setPilot", "params": params}
     if native_on():
         native_enqueue({"k": "wiz", "ip": str(ip).strip(), "p": payload})
         return True
@@ -3613,7 +3679,7 @@ def cb_pick_mode():
     choice = ss.get("mode_pick")
     if choice in ss.modes and choice != ss.active_mode:
         clear_room_override(ss.presence["room"])
-        apply_mode(choice)
+        apply_mode(choice, force=True)
         ss.pill_on = None
         ss.flash = "Mode: " + tr_mode(choice) + "  \u00B7  music: " + str(ss.modes[choice].get("genre", ""))
 
@@ -3682,6 +3748,13 @@ def cb_master(key):
     st.session_state.cfg["bed"] = max(0, min(100, int(st.session_state.get(key, 100))))
 
 
+def cb_instrument(ins, key):
+    ss = st.session_state
+    mix = full_mix(ss.cfg.get("mix"))
+    mix[ins] = max(0, min(100, int(ss.get(key, 0))))
+    ss.cfg["mix"] = mix
+
+
 def cb_layer(k, key):
     layers = layers_of()
     layers[k] = int(st.session_state.get(key, 0))
@@ -3699,6 +3772,14 @@ def render_zen_dock(shown):
         for k, lk in LAYER_KEYS:
             key = "lay_" + k + "_" + str(ss.get("lay_rev", 0))
             st.slider(zt(lk), 0, 100, value=layers[k], key=key, on_change=cb_layer, args=(k, key))
+        st.markdown("**\U0001F3BB Instruments**")
+        st.caption("Blend the instruments you like: piano, flute, violin, guitar, tabla, veena, santoor, bansuri and more.")
+        cur = full_mix(cfg.get("mix"))
+        icols = st.columns(2)
+        for i, ins in enumerate(INSTRUMENTS):
+            ikey = "zin_" + ins + "_" + str(ss.get("lay_rev", 0)) + "_" + re.sub(r"\W", "", str(ss.active_mode))
+            with icols[i % 2]:
+                st.slider(ins, 0, 100, value=int(cur[ins]), key=ikey, on_change=cb_instrument, args=(ins, ikey))
 
 
 def render_tell_bar():
@@ -4099,7 +4180,8 @@ ENGINE_JS = r"""
             out: null, msd: null, el: null, keep: null, worker: null, unlocked: false, viaEl: false, lastTitle: null };
   var MOB = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   A.viaEl = MOB && ('srcObject' in HTMLMediaElement.prototype);
-  var INS = ['Piano', 'Flute', 'Rain', 'Tabla', 'Veena', 'Singing Bowls', 'Strings', 'Ocean Waves', 'Sitar', 'Harp'];
+  var INS = ['Piano', 'Flute', 'Rain', 'Tabla', 'Veena', 'Singing Bowls', 'Strings', 'Ocean Waves', 'Sitar', 'Harp',
+             'Violin', 'Guitar', 'Santoor', 'Bansuri'];
   var TEN = 'BNNBBNNBBTTNNNNB';
   function NOTE(m) { return (A.tune || 440) * Math.pow(2, (m - 69) / 12); }
   var SC = { maj: [0, 2, 4, 5, 7, 9, 11], min: [0, 2, 3, 5, 7, 8, 10], pent: [0, 2, 4, 7, 9], mpent: [0, 3, 5, 7, 10],
@@ -4321,6 +4403,29 @@ ENGINE_JS = r"""
       tone('sine', NOTE(m) * 2, t + k * 0.09, 0.08, 1.2, d, 0.003);
     });
   }
+  function violin(f, t, dur, d) {
+    var c = A.ctx, o = pad('sawtooth', f, t, 0.12, dur * 0.3, dur, d, 0, ['lowpass', 2600, 0.8]), lfo = c.createOscillator(), lg = c.createGain();
+    pad('sawtooth', f * 1.004, t, 0.08, dur * 0.3, dur, d, 0, ['lowpass', 2200, 0.8]);
+    lfo.frequency.value = 5.6; lg.gain.value = 12; lfo.connect(lg); lg.connect(o.detune); lfo.start(t); lfo.stop(t + dur + 0.2);
+  }
+  function guitar(f, t, d) {
+    tone('triangle', f, t, 0.3, 1.8, d, 0.002, 0, ['lowpass', 3200, 1]);
+    tone('sine', f * 2, t, 0.08, 1.0, d, 0.002);
+    tone('sine', f * 3, t, 0.03, 0.6, d, 0.002);
+    nburst(t, 0.02, 'bandpass', 1800, 0.06, d);
+  }
+  function santoor(f, t, d) {
+    tone('triangle', f, t, 0.26, 1.5, d, 0.002);
+    tone('sine', f * 2.01, t, 0.12, 0.9, d, 0.002);
+    tone('sine', f * 4.02, t + 0.01, 0.04, 0.5, d, 0.002);
+    nburst(t, 0.015, 'highpass', 5000, 0.05, d);
+  }
+  function bansuri(f, t, dur, d) {
+    var c = A.ctx, o = pad('sine', f, t, 0.3, 0.18, dur, d, 0), lfo = c.createOscillator(), lg = c.createGain();
+    pad('triangle', f, t, 0.05, 0.2, dur, d, 3);
+    lfo.frequency.value = 4.6; lg.gain.value = 14; lfo.connect(lg); lg.connect(o.detune); lfo.start(t); lfo.stop(t + dur + 0.2);
+    nburst(t, dur * 0.9, 'bandpass', 2600, 0.04, d);
+  }
   function walk(k, sc) {
     var w = A.w, st = [-2, -1, -1, 0, 1, 1, 2];
     w[k] = (w[k] === undefined ? 3 : w[k]) + st[Math.floor(Math.random() * st.length)];
@@ -4421,6 +4526,13 @@ ENGINE_JS = r"""
     if (L('Veena') > 0.02 && s % 2 === 0 && Math.random() < 0.6) { veena(NOTE(st.root + 12 + walk('ve', 'pent')), t, G('Veena')); }
     if (L('Sitar') > 0.02 && (s % 4 === 3 || s === 0) && Math.random() < 0.8) { sitar(NOTE(st.root + 12 + walk('si', 'pent')), t, G('Sitar')); }
     if (L('Harp') > 0.02 && s % 8 === 0) { harp(ch, t, G('Harp')); }
+    if (L('Violin') > 0.02 && s % 16 === 4 && Math.random() < 0.9) { violin(NOTE(st.root + 12 + walk('vi', st.ls || st.sc)), t, dur * 12, G('Violin')); }
+    if (L('Guitar') > 0.02 && s % 2 === 0) {
+      if (s % 8 === 0) { ch.forEach(function (mid, i) { guitar(NOTE(mid), t + i * 0.05, G('Guitar')); }); }
+      else if (Math.random() < 0.5) { guitar(NOTE(ch[Math.floor(Math.random() * ch.length)] + 12), t, G('Guitar')); }
+    }
+    if (L('Santoor') > 0.02 && s % 2 === 0 && Math.random() < 0.65) { santoor(NOTE(st.root + 24 + walk('sa', 'pent')), t, G('Santoor')); }
+    if (L('Bansuri') > 0.02 && s % 16 === 10 && Math.random() < 0.9) { bansuri(NOTE(st.root + 12 + walk('ba', 'pent')), t, dur * 10, G('Bansuri')); }
     if (L('Strings') > 0.02 && s === 0) { strings(ch, t, dur * 16, G('Strings')); }
     if (L('Singing Bowls') > 0.02 && s === 0 && bar % 2 === 0) { bowl(NOTE(st.root + 24 + (bar % 4 === 0 ? 0 : 7)), t, G('Singing Bowls')); }
     if (L('Rain') > 0.02 && Math.random() < 0.6) { nburst(t + Math.random() * dur, 0.025, 'highpass', 4000, 0.16, G('Rain')); }
@@ -4999,6 +5111,10 @@ def with_native_flush(fn):
     Hand them to the phone at the end of every fragment run (the function keeps its name, so its fragment id is unchanged)."""
     @functools.wraps(fn)
     def _w(*a, **k):
+        try:
+            auto_reconnect()                 # bring unreachable devices back before drawing the page
+        except Exception:
+            pass
         r = fn(*a, **k)
         try:
             render_native_out()
@@ -5009,6 +5125,10 @@ def with_native_flush(fn):
 
 
 def run_live(fn):
+    try:
+        auto_reconnect()
+    except Exception:
+        pass
     if hasattr(st, "fragment"):
         st.fragment(run_every=st.session_state.cfg["poll"])(with_native_flush(fn))()
     else:
@@ -5454,7 +5574,7 @@ def zen_go(kind):
     if mode not in ss.modes:
         return
     clear_room_override(room)
-    apply_mode(mode)
+    apply_mode(mode, force=True)
     if kind == "sleep":
         ss.fade_tok += 1
     ss.flash = "✨ " + tr_mode(mode)
@@ -5642,14 +5762,14 @@ def voice_do(kind):
         return "🌙 Wind-Down Sleep is on and the bulbs are dimmed. Rest well."
     if kind == "work":
         clear_room_override(ss.presence["room"])
-        apply_mode("Focus")
+        apply_mode("Focus", force=True)
         for d in ss.fleet:
             if d["cid"] == "tasklight" and d["room"] in (room, ss.presence["room"], "Work Studio"):
                 set_dev(d, True, 80)
         return "💼 Focus mode is on with bright task lighting."
     if kind == "movie":
         clear_room_override(ss.presence["room"])
-        apply_mode(CINEMA_MODE)
+        apply_mode(CINEMA_MODE, force=True)
         for d in near:
             if d["cid"] in ("tv", "projector"):
                 set_dev(d, True)
@@ -5658,7 +5778,7 @@ def voice_do(kind):
         return "🎬 Curtains closed and Cinematic lighting is on. Enjoy the movie."
     if kind == "relax":
         clear_room_override(ss.presence["room"])
-        apply_mode("Relax Evening")
+        apply_mode("Relax Evening", force=True)
         return "🌿 Relax Evening is on."
     if kind == "away":
         set_away_mode()
@@ -6426,7 +6546,7 @@ def cb_mode_save(sel):
                          ac=int(g("me_ac_", 24)), curtain=int(g("me_cu_", 50)), genre=g("me_gn_", GENRES[0]),
                          bulb_on=bool(g("me_bo_", True)), fan_on=bool(g("me_fo_", True)), ac_on=bool(g("me_ao_", True)))
     if sel == ss.active_mode:
-        apply_mode(sel)
+        apply_mode(sel, force=True)
     ss.flash = "Saved: " + tr_mode(sel)
 
 
@@ -6438,7 +6558,7 @@ def cb_mode_reset(sel):
         for k in [k for k in list(ss.keys()) if k.startswith("me_") and k.endswith("_" + sel)]:
             ss.pop(k, None)
         if sel == ss.active_mode:
-            apply_mode(sel)
+            apply_mode(sel, force=True)
         ss.flash = "Back to the original settings: " + tr_mode(sel)
 
 
@@ -8048,7 +8168,7 @@ def run_auto_mode(mid, source="app"):
         if arg not in ss.modes:
             return ""
         clear_room_override(ss.presence["room"])
-        apply_mode(arg)
+        apply_mode(arg, force=True)
         msg, shown = icon + " " + tr_mode(arg), arg
     try:
         player_cmd("play")
@@ -8916,7 +9036,7 @@ def apply_room_theme(room):
     for d in devs:
         ss.holds.pop(d["uid"], None)                     # an explicit choice beats an old manual hold
     clear_room_override(ss.presence["room"])
-    apply_mode(mode, devs=devs)                          # sets the active mode (so the player follows) and the room's devices
+    apply_mode(mode, devs=devs, force=True)              # sets the active mode (so the player follows) and the room's devices
     set_layers(layers)
     ss.pill_on = pill
     player_cmd("play")
@@ -8956,6 +9076,23 @@ AI_DEV_WORDS = (
 AI_COLORS = {"warm": "#FFB347", "white": "#FFFFFF", "red": "#FF3B30", "blue": "#2F6BFF", "green": "#34C759",
              "purple": "#9B59FF", "violet": "#9B59FF", "pink": "#FF6FB5", "orange": "#FF8A1E", "yellow": "#FFE066",
              "cool": "#CFE8FF"}
+AI_COLOR_RX = (r"warm white|soft white|warm|warmer|candle ?light|candle|amber|golden|cozy|cosy|cool white|cold white|"
+               r"daylight|day light|cooler|colder|white|red|blue|green|purple|violet|pink|orange|yellow|cool")
+AI_COLOR_MAP = {"warm white": "warm", "soft white": "warm", "warmer": "warm", "candle": "warm", "candlelight": "warm",
+                "candle light": "warm", "amber": "warm", "golden": "warm", "cozy": "warm", "cosy": "warm",
+                "cool white": "cool", "cold white": "cool", "daylight": "cool", "day light": "cool", "cooler": "cool",
+                "colder": "cool"}
+
+
+def ai_colour(text):
+    """Hex colour named in a sentence ('warm', 'warm white', 'warmer', 'candlelight', 'cool white' ...), else None."""
+    m = re.search(r"\b(" + AI_COLOR_RX + r")\b", text)
+    if not m:
+        return None
+    w = m.group(1)
+    return AI_COLORS.get(AI_COLOR_MAP.get(w, w))
+
+
 AI_STEP = {"lights": 20, "AC": 2, "fan": 1, "curtains": 25, "speaker": 15}
 AI_MODE_CUE = (r"\b(?:mode|activate|switch to|change to|set to|turn to|go to|put on|play|start|begin|enable)\b|"
                r"\b(?:i'?m|i am) home\b|\bback home\b|\bleaving\b|\bgoing out\b|\bheading out\b|\bgood ?night\b|"
@@ -9086,8 +9223,10 @@ def ai_clause(c, room_ctx, last_act):
             n_act, n_n = last_act
         n_color = None
         if any(d["cid"] in LIGHT_CIDS for d in named):
-            cm = re.search(r"\b(warm|white|red|blue|green|purple|violet|pink|orange|yellow|cool)\b", c_num)
-            n_color = AI_COLORS.get(cm.group(1)) if cm else None
+            n_color = ai_colour(c_num)
+            if n_color and n_act in ("up", "down") and re.search(r"\b(warmer|cooler|colder)\b", c_num) \
+                    and not re.search(r"\b(bright\w*|dim\w*|darker|increase|decrease|reduce|raise|boost)\b", c_num):
+                n_act = None                                   # "make it warmer" changes colour, not brightness
         if n_act is not None or n_color:
             for d in named:
                 ai_apply_one(d, n_act, n_n, c_num, n_color if d["cid"] in LIGHT_CIDS else None, CAT[d["cid"]][2])
@@ -9118,8 +9257,10 @@ def ai_clause(c, room_ctx, last_act):
                 wh = "All rooms"
             color = None
             if label == "lights":
-                cm = re.search(r"\b(warm|white|red|blue|green|purple|violet|pink|orange|yellow|cool)\b", c)
-                color = AI_COLORS.get(cm.group(1)) if cm else None
+                color = ai_colour(c)
+                if color and act in ("up", "down") and re.search(r"\b(warmer|cooler|colder)\b", c) \
+                        and not re.search(r"\b(bright\w*|dim\w*|darker|increase|decrease|reduce|raise|boost)\b", c):
+                    act = None                                 # "make it warmer" changes colour, not brightness
             if not devs:
                 out.append("⚠ No " + label + " added yet. Tap Add a device first.")
                 continue
@@ -9128,8 +9269,7 @@ def ai_clause(c, room_ctx, last_act):
             for d in devs:
                 ai_apply_one(d, act, n, c, color, label)
             first = devs[0]
-            cname = (re.search(r"\b(warm|white|red|blue|green|purple|violet|pink|orange|yellow|cool)\b", c).group(1)
-                     if color else "")
+            cname = (re.search(r"\b(" + AI_COLOR_RX + r")\b", c).group(1) if color else "")
             if act == "off":
                 state = "off"
             elif act in ("close", "open"):
@@ -9697,6 +9837,20 @@ def cb_manual_mode(key):
     ss.man_rev = ss.get("man_rev", 0) + 1
 
 
+def cb_reapply_mode():
+    ss = st.session_state
+    name = ss.active_mode
+    if name not in ss.modes:
+        return
+    devs = space_devs(current_room())
+    for d in devs:
+        ss.holds.pop(d["uid"], None)
+    clear_room_override(ss.presence["room"])
+    apply_mode(name, devs=devs, force=True)
+    ss.flash = "\U0001F501 " + tr_mode(name) + " re-applied"
+    ss.man_rev = ss.get("man_rev", 0) + 1
+
+
 def render_manual_priority():
     ss = st.session_state
     names = list(ss.modes)
@@ -9707,6 +9861,8 @@ def render_manual_priority():
                "music for this room, and every change you make below is kept exactly as you set it.")
     st.selectbox("Mode", names, index=names.index(cur), key=key, format_func=tr_mode, on_change=cb_manual_mode, args=(key,),
                  label_visibility="collapsed")
+    st.button("\U0001F501 Re-apply this mode", key="man_reapply_" + str(ss.get("man_rev", 0)), on_click=cb_reapply_mode,
+              help="Set the lights, fan, AC and curtains of this room back to the mode's own settings.")
 
 
 # ---- F. Divine Compass: a STAIA-style astrologer that already knows your chart ----
