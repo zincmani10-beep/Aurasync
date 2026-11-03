@@ -5,9 +5,19 @@ on:
   push:
     branches: [main]
 
+# If several commits arrive close together, keep the build that is running and replace
+# any older build that is still waiting, so the queue never fills up with old builds.
+concurrency:
+  group: ios-build
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: macos-latest
+    # macOS 26 on an Intel machine: the same operating system as macos-latest, but a different
+    # pool of machines. The Apple-silicon pool is short of capacity right now.
+    # If this ever stops working, go back to: runs-on: macos-latest
+    runs-on: macos-26-intel
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
