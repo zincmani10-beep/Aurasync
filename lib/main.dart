@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 /// Your hosted AuraSync (Streamlit Community Cloud).
@@ -56,6 +57,14 @@ class _AuraHomeState extends State<AuraHome> {
   bool _loading = true;
   bool _failed = false;
   bool _setupRunning = false;
+
+  // WiZ bulbs found by the last search (sent to the page with the next update)
+  List<String>? _wizFound;
+
+  // Always-on service: where heart-rate readings are also sent (set by the page)
+  String _ingestUrl = '';
+  String _ingestKey = '';
+  DateTime _lastIngest = DateTime.fromMillisecondsSinceEpoch(0);
 
   // Bluetooth heart-rate state
   static final Guid _hrService = Guid('180D');
@@ -113,6 +122,7 @@ class _AuraHomeState extends State<AuraHome> {
         },
       ))
       ..loadRequest(Uri.parse(kAuraUrl));
+    WidgetsBinding.instance.addPostFrameCallback((_) => _reconnectLast());
   }
 
   @override
@@ -144,10 +154,49 @@ class _AuraHomeState extends State<AuraHome> {
         if (msg['k'] == 'setup') {
           // The "Set up everything" button on the page.
           if (mounted) unawaited(_startSetup());
+        } else if (msg['k'] == 'ingest') {
+          _setIngest(msg);
+        } else if (msg['k'] == 'hr_open') {
+          if (mounted) _openPicker();
+        } else if (msg['k'] == 'hr_off') {
+          await _forgetBand();
+          await _disconnect();
+        } else if (msg['k'] == 'wiz_scan') {
+          unawaited(_scanWiz());
         } else {
           await _runCommand(msg);
         }
         break;
+    }
+  }
+
+  void _setIngest(Map<String, dynamic> c) {
+    final u = Uri.tryParse('${c['url']}');
+    final k = '${c['key']}';
+    if (u != null && u.scheme == 'https' && k.length >= 20) {
+      _ingestUrl = u.toString();
+      _ingestKey = k;
+    }
+  }
+
+  /// Sends the reading to the always-on service (at most every 10 seconds), so the home
+  /// follows the heart rate even when the AuraSync page is not open.
+  Future<void> _ingest(int hr) async {
+    if (_ingestUrl.isEmpty) return;
+    final now = DateTime.now();
+    if (now.difference(_lastIngest).inSeconds < 10) return;
+    _lastIngest = now;
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+      final req = await client.postUrl(Uri.parse(_ingestUrl));
+      req.headers.contentType = ContentType.json;
+      req.headers.set('Authorization', 'Bearer $_ingestKey');
+      req.add(utf8.encode(jsonEncode({'hr': hr, 'tz': now.timeZoneOffset.inMinutes})));
+      final res = await req.close();
+      await res.drain<void>();
+      client.close();
+    } catch (_) {
+      // No network for a moment must never crash the app.
     }
   }
 
@@ -193,6 +242,77 @@ class _AuraHomeState extends State<AuraHome> {
     } catch (_) {
       // A bulb that is offline must never crash the app.
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // WiZ bulb search: asks every address on the home Wi-Fi (a unicast sweep, so no special
+  // Apple networking entitlement is needed). A WiZ bulb answers getPilot.
+  // ---------------------------------------------------------------------------
+  Future<void> _scanWiz() async {
+    _wizFound = null;
+    final found = <String>{};
+    try {
+      String? ip;
+      final ifs = await NetworkInterface.list(type: InternetAddressType.IPv4);
+      for (final i in ifs) {
+        if (i.name != 'en0') continue; // Wi-Fi
+        for (final a in i.addresses) {
+          if (_isPrivateHost(a.address)) ip = a.address;
+        }
+      }
+      if (ip != null) {
+        final p = ip.split('.');
+        final prefix = '${p[0]}.${p[1]}.${p[2]}';
+        final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+        sock.listen((e) {
+          if (e != RawSocketEvent.read) return;
+          final d = sock.receive();
+          if (d == null) return;
+          try {
+            final j = jsonDecode(utf8.decode(d.data));
+            if (j is Map && j['result'] != null) found.add(d.address.address);
+          } catch (_) {}
+        }, onError: (_) {});
+        final msg = utf8.encode(jsonEncode({'method': 'getPilot', 'params': {}}));
+        for (var i = 1; i < 255; i++) {
+          try {
+            sock.send(msg, InternetAddress('$prefix.$i'), 38899);
+          } catch (_) {}
+          if (i % 40 == 0) await Future.delayed(const Duration(milliseconds: 30));
+        }
+        await Future.delayed(const Duration(seconds: 4));
+        sock.close();
+      }
+    } catch (_) {}
+    _wizFound = found.toList()..sort();
+    await _push();
+    _wizFound = null; // sent once
+  }
+
+  // ---------------------------------------------------------------------------
+  // Remember the last heart-rate device and reconnect to it on its own
+  // ---------------------------------------------------------------------------
+  Future<void> _rememberBand(BluetoothDevice d) async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setString('last_band', d.remoteId.str);
+    } catch (_) {}
+  }
+
+  Future<void> _forgetBand() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.remove('last_band');
+    } catch (_) {}
+  }
+
+  Future<void> _reconnectLast() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      final id = sp.getString('last_band');
+      if (id == null || id.isEmpty || _btState == 'connected') return;
+      await _connect(BluetoothDevice.fromId(id), auto: true);
+    } catch (_) {}
   }
 
   // ---------------------------------------------------------------------------
@@ -289,6 +409,7 @@ class _AuraHomeState extends State<AuraHome> {
       'err': err ?? '',
       'src': 'Bluetooth 0x180D',
       'nat': 1, // "I am the iPhone app": the page then routes device commands through this phone
+      if (_wizFound != null) 'wiz': _wizFound,
     };
     final js = '''
 (function(p){
@@ -349,12 +470,13 @@ class _AuraHomeState extends State<AuraHome> {
       _lastPush = now;
       _push(hr: hr);
     }
+    _ingest(hr);
   }
 
-  Future<void> _connect(BluetoothDevice dev) async {
+  Future<void> _connect(BluetoothDevice dev, {bool auto = false}) async {
     try {
       await FlutterBluePlus.stopScan();
-      await dev.connect(timeout: const Duration(seconds: 15));
+      await dev.connect(timeout: Duration(seconds: auto ? 8 : 15));
       _device = dev;
       _connSub?.cancel();
       _connSub = dev.connectionState.listen((s) {
@@ -371,9 +493,11 @@ class _AuraHomeState extends State<AuraHome> {
       _hrSub?.cancel();
       _hrSub = ch.lastValueStream.listen(_onHrData);
       _btState = 'connected';
+      await _rememberBand(dev);
       if (mounted) setState(() {});
       await _push();
     } catch (e) {
+      if (auto) return; // the saved band is simply not nearby: stay quiet
       _btState = 'error';
       if (mounted) setState(() {});
       await _push(err: 'connect');
@@ -404,6 +528,7 @@ class _AuraHomeState extends State<AuraHome> {
         },
         onDisconnect: () {
           Navigator.pop(context);
+          _forgetBand();
           _disconnect();
         },
         hrService: _hrService,
