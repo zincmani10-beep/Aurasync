@@ -1842,6 +1842,18 @@ DEFAULT_MODES = {
     "Neutral Family Ambience": {"bulb": "#FFE6C7", "bright": 55, "fan": 2, "ac": 24, "curtain": 50, "genre": "Ambient Space",
                                 "extras": ["speaker"]},
 }
+DEFAULT_MODES.update({
+    "Gym": {"bulb": "#FF5A36", "bright": 100, "fan": 4, "ac": 21, "curtain": 100, "genre": "Hip-Hop",
+            "extras": ["speaker", "ledstrip"]},
+    "Running": {"bulb": "#FFFFFF", "bright": 100, "fan": 5, "ac": 22, "curtain": 100, "genre": "EDM",
+                "extras": ["speaker"]},
+    "Yoga": {"bulb": "#C8E6C9", "bright": 45, "fan": 1, "ac": 25, "curtain": 60, "genre": "Calm 432Hz",
+             "extras": ["scent", "speaker", "diffuser"]},
+    "Exercise": {"bulb": "#FFE9C4", "bright": 95, "fan": 4, "ac": 22, "curtain": 100, "genre": "Pop",
+                 "extras": ["speaker"]},
+    "Cooking": {"bulb": "#FFF1D6", "bright": 90, "fan": 3, "ac": 24, "curtain": 100, "genre": "Jazz",
+                "extras": ["speaker"]},
+})
 NEUTRAL_MODE = "Neutral Family Ambience"
 CINEMA_MODE = "Cinema Night"
 # Room personas: personal sanctuaries follow one person, shared family zones protect the whole family
@@ -2722,6 +2734,7 @@ def connect_all():
 
 
 # ---- Saved home: devices + rooms are kept in the user's account so they are still there next time ----------
+MODE_SAVE_KEYS = ("bulb", "bright", "fan", "ac", "curtain", "genre", "extras", "bulb_on", "fan_on", "ac_on", "acmode", "mix")
 HOME_PROTOS = ("Simulation", "Philips WiZ (UDP)", "Home Assistant / REST", "Home Assistant API", "Matter over Thread/Wi-Fi")
 
 
@@ -2745,7 +2758,8 @@ def home_to_json():
     ha = ss.cfg.get("ha") if isinstance(ss.cfg.get("ha"), dict) else {}
     return {"v": 1, "devices": devs, "spaces": spaces, "wiz_ip": str(ss.cfg.get("wiz_ip", "")),
             "ha": {"url": str(ha.get("url", "")), "token": str(ha.get("token", ""))},
-            "always": alw_clean(ss.cfg.get("always")), "aliases": dict(ss.get("room_alias") or {})}
+            "always": alw_clean(ss.cfg.get("always")), "aliases": dict(ss.get("room_alias") or {}),
+            "modes": {n: {k: m.get(k) for k in MODE_SAVE_KEYS if k in m} for n, m in ss.get("modes", {}).items()}}
 
 
 def home_restore():
@@ -2805,6 +2819,20 @@ def home_restore():
                               "persona": sp.get("persona") if sp.get("persona") in ("personal", "shared") else None}
         ss.fleet, ss.spaces = fleet, spaces
         ss.uid = max([ss.uid] + list(seen))
+        sm = h.get("modes") if isinstance(h.get("modes"), dict) else {}
+        for nm, m in list(sm.items())[:60]:
+            if not isinstance(nm, str) or not isinstance(m, dict) or not valid_mode_name(nm):
+                continue
+            try:
+                ss.modes[nm] = dict(ss.modes.get(nm, {}), bulb=safe_hex(m.get("bulb")),
+                                    bright=max(5, min(100, int(m.get("bright", 60)))), fan=max(0, min(5, int(m.get("fan", 1)))),
+                                    ac=max(16, min(30, int(m.get("ac", 24)))), curtain=max(0, min(100, int(m.get("curtain", 50)))),
+                                    genre=m.get("genre") if m.get("genre") in GENRES else GENRES[0],
+                                    bulb_on=bool(m.get("bulb_on", True)), fan_on=bool(m.get("fan_on", True)),
+                                    ac_on=bool(m.get("ac_on", True)), extras=[x for x in (m.get("extras") or []) if x in AMB][:12],
+                                    mix=full_mix(m.get("mix")))
+            except (TypeError, ValueError):
+                pass
         al = h.get("aliases") if isinstance(h.get("aliases"), dict) else {}
         ss["room_alias"] = {k: str(v)[:40] for k, v in al.items() if k in spaces and str(v).strip()}
         ip = str(h.get("wiz_ip") or "").strip()
@@ -3568,6 +3596,35 @@ def cb_zen_pill(kind):
     ss.pill_on = kind
     if msg:
         ss.flash = msg
+
+
+MODE_ORDER = ("Relax Evening", "Focus", "Reading", "Cooking", "Deep Meditation", "Zen Garden", "Yoga", "Gym", "Running",
+              "Exercise", "Energize", "Cinema Night", "Sleep", "Wind-Down Sleep", "Deep Calm Studio")
+
+
+def mode_names():
+    ss = st.session_state
+    first = [m for m in MODE_ORDER if m in ss.modes]
+    return first + [m for m in ss.modes if m not in first and m != NEUTRAL_MODE]
+
+
+def cb_pick_mode():
+    ss = st.session_state
+    choice = ss.get("mode_pick")
+    if choice in ss.modes and choice != ss.active_mode:
+        clear_room_override(ss.presence["room"])
+        apply_mode(choice)
+        ss.pill_on = None
+        ss.flash = "Mode: " + tr_mode(choice) + "  \u00B7  music: " + str(ss.modes[choice].get("genre", ""))
+
+
+def render_mode_dropdown():
+    ss = st.session_state
+    names = mode_names()
+    if ss.active_mode not in names:
+        names = [ss.active_mode] + names
+    ss["mode_pick"] = ss.active_mode
+    st.selectbox("Active mode", names, key="mode_pick", on_change=cb_pick_mode, format_func=tr_mode)
 
 
 def render_zen_pills():
@@ -5266,14 +5323,9 @@ def page_dashboard_pro():
     ss.prev_auto = cfg["auto_mode"]
     c1, c2 = st.columns(2)
     with c1:
-        if not cfg["auto_mode"]:
-            names = list(ss.modes.keys())
-            choice = st.selectbox(t("atmos"), names, index=names.index(ss.active_mode), format_func=tr_mode)
-            if choice != ss.active_mode:
-                clear_room_override(ss.presence["room"])
-                apply_mode(choice)
-        else:
-            st.info(t("auto_on"))
+        render_mode_dropdown()
+        if cfg["auto_mode"]:
+            st.caption(t("auto_on"))
     with c2:
         opts = [0, 15, 30, 45, 60, 90, 120]
         new_t = st.selectbox(t("timer"), opts, index=opts.index(cfg["timer"]),
@@ -5415,8 +5467,8 @@ def page_dashboard_zen():
     render_rooms()
     shown = eff_mode()
     render_zen_card(current_room(), shown)
-    # 1. instant mood pills
-    render_zen_pills()
+    # 1. one Active mode dropdown (every mode brings its own light, fan, AC, curtains and music)
+    render_mode_dropdown()
     # Auto / Manual (Manual pauses the biometric takeover)
     if cfg["auto_mode"] and not ss.prev_auto:
         ss.last_state = None
@@ -6363,12 +6415,99 @@ def extra_name(k):
     return CAT[k][1] + " " + CAT[k][2]
 
 
-def page_moods():
-    if st.session_state.ui_mode == "pro":
-        page_moods_pro()
+def cb_mode_save(sel):
+    ss = st.session_state
+    g = lambda k, d: ss.get(k + sel, d)
+    col = g("me_col_", ss.modes[sel]["bulb"])
+    if not valid_hex(col):
+        ss.flash = "Pick a valid light colour."
         return
+    ss.modes[sel] = dict(ss.modes[sel], bulb=col.strip(), bright=int(g("me_br_", 60)), fan=int(g("me_fan_", 1)),
+                         ac=int(g("me_ac_", 24)), curtain=int(g("me_cu_", 50)), genre=g("me_gn_", GENRES[0]),
+                         bulb_on=bool(g("me_bo_", True)), fan_on=bool(g("me_fo_", True)), ac_on=bool(g("me_ao_", True)))
+    if sel == ss.active_mode:
+        apply_mode(sel)
+    ss.flash = "Saved: " + tr_mode(sel)
+
+
+def cb_mode_reset(sel):
+    ss = st.session_state
+    if sel in DEFAULT_MODES:
+        ss.modes[sel] = dict(DEFAULT_MODES[sel])
+        ensure_modes()
+        for k in [k for k in list(ss.keys()) if k.startswith("me_") and k.endswith("_" + sel)]:
+            ss.pop(k, None)
+        if sel == ss.active_mode:
+            apply_mode(sel)
+        ss.flash = "Back to the original settings: " + tr_mode(sel)
+
+
+def cb_mode_add():
+    ss = st.session_state
+    nm = (ss.get("cm_name") or "").strip()
+    col = ss.get("cm_col", "#FFB347")
+    if not valid_mode_name(nm):
+        ss.flash = "Give your mode a name (letters and numbers, up to 30 characters)."
+    elif nm in ss.modes:
+        ss.flash = "You already have a mode with that name."
+    elif not valid_hex(col):
+        ss.flash = "Pick a valid light colour."
+    else:
+        ss.modes[nm] = {"bulb": col.strip(), "bright": int(ss.get("cm_br", 60)), "fan": int(ss.get("cm_fan", 1)),
+                        "ac": int(ss.get("cm_ac", 24)), "curtain": int(ss.get("cm_cu", 50)),
+                        "genre": ss.get("cm_gn", GENRES[0]), "bulb_on": bool(ss.get("cm_bo", True)),
+                        "fan_on": bool(ss.get("cm_fo", True)), "ac_on": bool(ss.get("cm_ao", True)),
+                        "extras": [], "mix": full_mix(None)}
+        ensure_modes()
+        ss.flash = "Your mode is ready: " + nm + ". Find it in the Active mode dropdown."
+        for k in ("cm_name",):
+            ss.pop(k, None)
+
+
+def page_moods():
+    ss = st.session_state
     st.header(t("p2"))
-    st.caption(t("zen_hidden"))
+    st.subheader("\U0001F3A8 Edit a mode")
+    st.caption("Choose a mode, then set the light, fan, AC, curtains and music it brings. Changes are saved to your account.")
+    names = mode_names()
+    sel = st.selectbox("Mode", names, index=names.index(ss.active_mode) if ss.active_mode in names else 0,
+                       key="edit_mode_sel", format_func=tr_mode)
+    m = ss.modes[sel]
+    c1, c2 = st.columns(2)
+    c1.color_picker("Light colour", m["bulb"], key="me_col_" + sel)
+    c2.slider("Light brightness", 5, 100, int(m.get("bright", 60)), key="me_br_" + sel)
+    c3, c4 = st.columns(2)
+    c3.slider("Fan speed (0 = off)", 0, 5, int(m["fan"]), key="me_fan_" + sel)
+    c4.slider("AC temperature", 16, 30, int(m["ac"]), key="me_ac_" + sel)
+    st.slider("Curtains open (%)", 0, 100, int(m.get("curtain", 50)), key="me_cu_" + sel)
+    st.selectbox("Music", GENRES, index=GENRES.index(m["genre"]) if m["genre"] in GENRES else 0, key="me_gn_" + sel)
+    t1, t2, t3 = st.columns(3)
+    t1.toggle("Light on", value=bool(m.get("bulb_on", True)), key="me_bo_" + sel)
+    t2.toggle("Fan on", value=bool(m.get("fan_on", True)), key="me_fo_" + sel)
+    t3.toggle("AC on", value=bool(m.get("ac_on", True)), key="me_ao_" + sel)
+    b1, b2 = st.columns(2)
+    b1.button("Save", key="me_save_" + sel, type="primary", on_click=cb_mode_save, args=(sel,), width="stretch")
+    if sel in DEFAULT_MODES:
+        b2.button("Reset to original", key="me_reset_" + sel, on_click=cb_mode_reset, args=(sel,), width="stretch")
+
+    st.divider()
+    st.subheader("\u2795 Add your own mode")
+    st.text_input("Mode name", key="cm_name", max_chars=30, placeholder="For example: Study night")
+    d1, d2 = st.columns(2)
+    d1.color_picker("Light colour", "#FFB347", key="cm_col")
+    d2.slider("Light brightness", 5, 100, 60, key="cm_br")
+    d3, d4 = st.columns(2)
+    d3.slider("Fan speed (0 = off)", 0, 5, 1, key="cm_fan")
+    d4.slider("AC temperature", 16, 30, 24, key="cm_ac")
+    st.slider("Curtains open (%)", 0, 100, 50, key="cm_cu")
+    st.selectbox("Music", GENRES, key="cm_gn")
+    u1, u2, u3 = st.columns(3)
+    u1.toggle("Light on", value=True, key="cm_bo")
+    u2.toggle("Fan on", value=True, key="cm_fo")
+    u3.toggle("AC on", value=True, key="cm_ao")
+    st.button("Add mode", key="cm_add", type="primary", on_click=cb_mode_add, width="stretch")
+
+    st.divider()
     render_routines()
 
 
