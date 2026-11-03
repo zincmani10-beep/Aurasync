@@ -8,6 +8,7 @@ Secrets (.streamlit/secrets.toml, or the Secrets box on Streamlit Community Clou
   AURASYNC_TOKEN   protects the ?mode=...&token=... links and the "Voice Automation Links" panel (required for both)
   APP_URL, VOICEMONKEY_TOKEN, IOT_WEBHOOK_URL, ...   cloud IoT triggers, see the "Cloud automation" section below
 """
+import functools
 import os, logging, warnings
 warnings.filterwarnings("ignore")
 logging.getLogger("streamlit").setLevel(logging.ERROR)
@@ -4946,9 +4947,23 @@ def chime_component(auto):
                     height=48)
 
 
+def with_native_flush(fn):
+    """A live fragment re-runs without the rest of the page, so commands it queued for the iPhone would sit unsent.
+    Hand them to the phone at the end of every fragment run (the function keeps its name, so its fragment id is unchanged)."""
+    @functools.wraps(fn)
+    def _w(*a, **k):
+        r = fn(*a, **k)
+        try:
+            render_native_out()
+        except Exception:
+            pass
+        return r
+    return _w
+
+
 def run_live(fn):
     if hasattr(st, "fragment"):
-        st.fragment(run_every=st.session_state.cfg["poll"])(fn)()
+        st.fragment(run_every=st.session_state.cfg["poll"])(with_native_flush(fn))()
     else:
         fn()
 
@@ -5308,7 +5323,7 @@ def page_dashboard_pro():
     if cfg["source"] == "ble":
         render_wearable()
     if hasattr(st, "fragment"):
-        st.fragment(run_every=cfg["poll"])(bio_panel)()
+        st.fragment(run_every=cfg["poll"])(with_native_flush(bio_panel))()
     else:
         bio_panel()
         st.button("↻ Refresh")
@@ -5422,7 +5437,7 @@ def page_dashboard_zen():
         st.caption(zt("zk_ap_hint"))
     # 2. live heart-rate graph + emotion badge (the panel also drives the automation each polling tick)
     if hasattr(st, "fragment"):
-        st.fragment(run_every=cfg["poll"])(bio_panel_zen)()
+        st.fragment(run_every=cfg["poll"])(with_native_flush(bio_panel_zen))()
     else:
         bio_panel(True)
     # 3 + 4. living player dock and collapsible sound studio mixer
@@ -6227,6 +6242,13 @@ def cb_wiz_scan():
     native_enqueue({"k": "wiz_scan"})
 
 
+def cb_wiz_test(ip, on):
+    """Straight from the phone to the bulb, bypassing rooms and device settings: shows whether the phone can reach it."""
+    p = {"method": "setPilot", "params": ({"state": True, "temp": 2700, "dimming": 80} if on else {"state": False})}
+    native_enqueue({"k": "wiz", "ip": ip, "p": p})
+    st.session_state["wiz_test_msg"] = "Sent " + ("ON (warm white)" if on else "OFF") + " to " + ip + " through your iPhone."
+
+
 def render_hr_device_section():
     ss = st.session_state
     st.subheader("\u2764\ufe0f Heart-rate device")
@@ -6268,6 +6290,14 @@ def render_add_device_section():
             st.info("Searching your Wi-Fi. This takes a few seconds.")
         elif ss.get("wiz_found"):
             st.success("Found " + str(len(ss["wiz_found"])) + " bulb(s): " + ", ".join(ss["wiz_found"]))
+            for ip in ss["wiz_found"]:
+                t1, t2 = st.columns(2)
+                t1.button("\U0001F4A1 Test ON " + ip, key="wt_on_" + ip, on_click=cb_wiz_test, args=(ip, True))
+                t2.button("Test OFF " + ip, key="wt_off_" + ip, on_click=cb_wiz_test, args=(ip, False))
+            if ss.get("wiz_test_msg"):
+                st.caption(ss["wiz_test_msg"])
+            st.caption("Phone link: " + ("seen" if ss.get("native_seen") else "NOT seen (open AuraSync from the iPhone app)") +
+                       "  \u2022  Control through iPhone: " + ("ON" if ss.get("native_flag") else "OFF"))
         if not ss.get("native_seen"):
             st.caption("Searching works inside the AuraSync iPhone app. You can also type the address yourself.")
     else:
