@@ -3125,8 +3125,8 @@ def native_dev_cmd(dev):
     if dev["proto"].startswith("Philips"):
         if not wiz_ip_ok(dev["addr"]):
             return None
-        r, g, b = hex_rgb(dev["color"])
-        params = {"state": bool(dev["on"]), "dimming": max(10, int(dev["lvl"])), "r": r, "g": g, "b": b}
+        params = {"state": bool(dev["on"]), "dimming": max(10, int(dev["lvl"]))}
+        params.update(wiz_color_params(dev["color"]))
         return {"k": "wiz", "ip": str(dev["addr"]).strip(), "p": {"id": 1, "method": "setPilot", "params": params}}
     url = str(dev["addr"]).strip()
     if not url.lower().startswith(("http://", "https://")):
@@ -3180,6 +3180,173 @@ def cb_native_setup():
     log("✨ Asked the iPhone app to set up all permissions")
 
 
+# ---- Phone features: daily notification, Siri / Google shortcuts, home-screen widget, Health heart rate ----------
+PHONE_SHORTCUTS = (
+    # id, spoken phrase shown to the user, command text the app understands
+    ("relax", "Relax mode", "relax"),
+    ("focus", "Focus mode", "focus"),
+    ("sleep", "Good night", "good night"),
+    ("movie", "Movie time", "movie time"),
+    ("warm", "Warm light", "turn the bulb to warm"),
+    ("cool", "Cool light", "turn the bulb to cool white"),
+    ("off", "Lights off", "turn off the lights"),
+    ("brief", "Today's brief", "brief"),
+)
+
+
+def daily_brief(p=None, day=None):
+    """Do / Don't / Caution for one day (today by default), in the user's language. None when there is no profile yet."""
+    ss = st.session_state
+    p = p or ss.get("profile")
+    if not p or not p.get("name"):
+        return None
+    day = day or date.today()
+    ds = seed_of(profile_seed(p), day.isoformat())
+    ta = str(ss.get("lang", "")).startswith("Tamil")
+    pools = (DOS_TA, DONTS_TA, CAUTIONS_TA) if ta else (DOS, DONTS, CAUTIONS)
+    name = p["name"]
+    do, dont, caution = (pick(pools[0], ds, 3), pick(pools[1], ds, 17), pick(pools[2], ds, 29))
+    return {"date": day.isoformat(), "name": name.split()[0] if name.split() else name,
+            "do": do.replace("{n}", name), "dont": dont.replace("{n}", name), "caution": caution.replace("{n}", name)}
+
+
+def brief_notification(b):
+    first = b["name"].title()
+    return {"date": b["date"], "title": "\u2728 Good morning, " + first,
+            "body": "\u2705 Do: " + b["do"] + "\n\u274C Don't: " + b["dont"] + "\n\u26A0\uFE0F Caution: " + b["caution"]}
+
+
+def native_sync_notifications():
+    """Send the next 7 days of briefs and the chosen time to the phone, which schedules them as local notifications.
+    Local notifications fire even when the app is closed, so nothing needs to be sent from a server."""
+    ss, cfg = st.session_state, st.session_state.cfg
+    p = ss.get("profile")
+    if not ss.get("native_seen") or not p:
+        return False
+    if not cfg.get("brief_notif", True):
+        native_enqueue({"k": "notify_schedule", "enabled": False, "items": []})
+        return True
+    items = []
+    for i in range(7):
+        b = daily_brief(p, date.today() + timedelta(days=i))
+        if b:
+            items.append(brief_notification(b))
+    native_enqueue({"k": "notify_schedule", "enabled": True, "hour": int(cfg.get("brief_hour", 8)),
+                    "minute": int(cfg.get("brief_min", 0)), "items": items})
+    ss.native_notif_day = date.today().isoformat()
+    return True
+
+
+def native_sync_shortcuts():
+    native_enqueue({"k": "shortcuts", "items": [{"id": i, "phrase": ph, "cmd": c} for i, ph, c in PHONE_SHORTCUTS]})
+
+
+def widget_payload():
+    ss = st.session_state
+    b = ss.get("ble") or {}
+    fresh = bool(b.get("hr")) and time.time() - b.get("ts", 0) < max(60, b.get("ttl", 25))
+    br = daily_brief() or {}
+    bulb = next((d for d in ss.get("fleet") or [] if d["cid"] in BULBLIKE), None)
+    return {"hr": int(b["hr"]) if fresh else 0, "mode": str(ss.get("active_mode", "")),
+            "color": bulb["color"] if bulb else "", "light_on": bool(bulb and bulb["on"]),
+            "do": br.get("do", ""), "dont": br.get("dont", ""), "caution": br.get("caution", ""),
+            "ts": int(time.time())}
+
+
+def native_sync_widget(force=False):
+    """Hand the widget its data. Only sent when something changed (or every 5 minutes), so it stays cheap."""
+    ss = st.session_state
+    if not ss.get("native_seen"):
+        return
+    pl = widget_payload()
+    sig = json.dumps({k: v for k, v in pl.items() if k != "ts"}, sort_keys=True)
+    if force or sig != ss.get("widget_sig") or time.time() - ss.get("widget_ts", 0) > 300:
+        ss.widget_sig, ss.widget_ts = sig, time.time()
+        native_enqueue({"k": "widget", "data": pl})
+
+
+def native_housekeeping():
+    """Runs on every live refresh: first-contact sync, a fresh week of briefs each new day, widget refresh."""
+    ss = st.session_state
+    if not ss.get("native_seen"):
+        return
+    if ss.pop("native_resync", False):
+        native_sync_notifications()
+        native_sync_shortcuts()
+        native_sync_widget(force=True)
+    elif ss.get("native_notif_day") != date.today().isoformat():
+        native_sync_notifications()
+    native_sync_widget()
+
+
+def run_phone_command(text):
+    """A command spoken to Siri / Google Assistant, or tapped on the widget."""
+    low = text.strip().lower()
+    if low in ("brief", "today's brief", "todays brief", "daily brief"):
+        b = daily_brief()
+        if b:
+            st.session_state.flash = "\u2705 " + b["do"] + "  \u00B7  \u274C " + b["dont"] + "  \u00B7  \u26A0\uFE0F " + b["caution"]
+            native_enqueue({"k": "speak", "text": "Do: " + b["do"] + ". Don't: " + b["dont"] + ". Caution: " + b["caution"]})
+        return
+    if low in ("heart rate", "my heart rate", "bpm"):
+        pl = widget_payload()
+        native_enqueue({"k": "speak", "text": ("Your heart rate is " + str(pl["hr"]) + " beats per minute.") if pl["hr"]
+                        else "I have no fresh heart rate yet."})
+        return
+    msg = run_command(text)
+    native_enqueue({"k": "speak", "text": re.sub(r"[^\w\s.,'-]", "", str(msg))[:160] or "Done"})
+    native_sync_widget(force=True)
+
+
+def cb_brief_settings():
+    ss, cfg = st.session_state, st.session_state.cfg
+    cfg["brief_notif"] = bool(ss.get("brief_notif_w", True))
+    tm = ss.get("brief_time_w")
+    if tm is not None:
+        cfg["brief_hour"], cfg["brief_min"] = int(tm.hour), int(tm.minute)
+    native_sync_notifications()
+    ss.flash = "\U0001F514 Daily brief " + (("set for " + fmt12(dtime(cfg.get("brief_hour", 8), cfg.get("brief_min", 0)))) if cfg["brief_notif"] else "turned off")
+
+
+def cb_health_connect():
+    """One tap: the phone asks Health / Health Connect permission once, then streams heart rate from then on."""
+    ss = st.session_state
+    native_enqueue({"k": "health_start", "types": ["heart_rate", "hrv", "resting_hr"], "background": True})
+    ss.cfg["source"] = "ble"
+    ss.flash = "\u2764\uFE0F Tap Allow on the Health permission screen. Heart rate will then flow into AuraSync by itself."
+    log("\u2764\uFE0F Asked the phone to start the Health heart-rate sync")
+
+
+def render_phone_features():
+    ss, cfg = st.session_state, st.session_state.cfg
+    perm = ss.get("native_perm") or {}
+    st.markdown("**\U0001F4F1 Phone features**")
+    if not ss.get("native_seen"):
+        st.caption("These switch on automatically when AuraSync runs inside the iPhone or Android app.")
+    # Health heart-rate sync
+    b = ss.get("ble") or {}
+    live = b.get("src", "") in ("healthkit", "healthconnect") and b.get("hr") and time.time() - b.get("ts", 0) < 900
+    st.button("\u2764\uFE0F Connect Apple Health / Health Connect" if not perm.get("health") else "\u2764\uFE0F Reconnect Health",
+              key="health_connect_btn", type="primary", on_click=cb_health_connect, disabled=not ss.get("native_seen"),
+              help="One permission prompt, one time. After that your heart rate keeps flowing in, even when the app is closed.")
+    if live:
+        st.caption("\U0001F49A Health sync is live: " + str(b["hr"]) + " BPM, " + str(int(time.time() - b["ts"])) + " s ago")
+    elif perm.get("health"):
+        st.caption("\u2705 Health permission granted. Waiting for the next reading from your watch or band.")
+    # daily notification
+    st.toggle("\U0001F514 Send my daily Do's, Don'ts and Caution as a notification", value=bool(cfg.get("brief_notif", True)),
+              key="brief_notif_w", on_change=cb_brief_settings)
+    st.time_input("Notification time", value=dtime(int(cfg.get("brief_hour", 8)), int(cfg.get("brief_min", 0))),
+                  key="brief_time_w", on_change=cb_brief_settings, step=300)
+    if perm and perm.get("notifications") is False:
+        st.caption("\u26A0\uFE0F Notifications are blocked. Turn them on in the phone's Settings.")
+    # shortcuts
+    with st.expander("\U0001F5E3\uFE0F Siri and Google Assistant phrases"):
+        for _i, ph, c in PHONE_SHORTCUTS:
+            st.caption("\u201CHey Siri / Hey Google, " + ph + " in AuraSync\u201D \u2192 " + c)
+    st.caption("\U0001F9E9 Add the AuraSync widget from your home screen. It shows heart rate, current mode and today's brief.")
+
+
 def render_native_panel():
     ss = st.session_state
     st.toggle("📱 Control my devices through this iPhone app", value=bool(ss.get("native_flag")), key="native_ctl_w",
@@ -3199,6 +3366,7 @@ def render_native_panel():
     if ss.get("native_flag"):
         st.caption("💡 Commands sent to the phone: " + str(ss.get("native_sent_n", 0)))
         st.button("💡 Test: send a warm light to my real devices", key="native_test_btn", on_click=cb_native_test)
+    render_phone_features()
 
 
 HR_BRIDGE_KEY = "aura_hr_bridge"
@@ -3238,6 +3406,17 @@ def cb_hr_bridge():
         ss.native_seen = True
         ss.native_flag = True
         ss.native_ctl_w = True
+        ss.native_resync = True                              # give the phone the brief, shortcuts and widget data again
+    if d.get("nat") or ss.get("native_seen"):
+        ss.native_plat = str(d.get("plat", ss.get("native_plat", "")))[:12]
+        if d.get("perm") and isinstance(d["perm"], dict):    # {"health": true, "notifications": false, ...}
+            ss.native_perm = {str(k)[:20]: bool(v) for k, v in list(d["perm"].items())[:12]}
+        cmd = str(d.get("cmd", "")).strip()[:200]            # "relax mode", "lights warm", "brief" ... from Siri / Assistant / widget
+        if cmd and ss.get("native_seen"):
+            try:
+                run_phone_command(cmd)
+            except Exception as e:
+                log("⚠ Phone command skipped: " + type(e).__name__)
     b = dict(ss.get("ble") or {})
     b["state"] = str(d.get("st", ""))[:20]
     b["src"] = str(d.get("src", ""))[:30]
@@ -5113,6 +5292,10 @@ def with_native_flush(fn):
     def _w(*a, **k):
         try:
             auto_reconnect()                 # bring unreachable devices back before drawing the page
+        except Exception:
+            pass
+        try:
+            native_housekeeping()            # phone: daily brief, shortcuts, widget data
         except Exception:
             pass
         r = fn(*a, **k)
